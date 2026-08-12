@@ -73,7 +73,8 @@ export async function createVideoGenerationTask(config: AiConfig, prompt: string
         const seedanceImages = options?.firstFrame ? [options.firstFrame, ...references] : references;
         return createSeedanceTask(requestConfig, selectedModel, prompt, seedanceImages, videoReferences, audioReferences, options);
     }
-    if (requestConfig.apiFormat === "grok2api") {
+    // apiFormat grok2api, or model is grok-imagine-video* while channel still marked openai
+    if (requestConfig.apiFormat === "grok2api" || isGrokImagineVideoModel(selectedModel)) {
         const workflow = options?.workflow || "generate";
         if (workflow === "generate" && (videoReferences.length || audioReferences.length)) {
             throw new Error(apiText("videoReferencesUnsupported"));

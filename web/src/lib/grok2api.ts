@@ -127,9 +127,30 @@ export function grok2apiVideoDuration(seconds: string | number | undefined) {
     return Math.max(1, Math.min(15, n));
 }
 
+/** True when model id is any grok-imagine-video* (base / 1.5 / path-prefixed / channel-encoded). */
+export function isGrokImagineVideoModel(model: string | undefined) {
+    const id = bareGrok2apiModelId(model);
+    return id === "grok-imagine-video" || id.startsWith("grok-imagine-video-") || id.endsWith("/grok-imagine-video") || id.includes("/grok-imagine-video-");
+}
+
+/**
+ * Prefer videoModel over model — workbench keeps image model in `model` and the
+ * selected video id in `videoModel`. Using model-first incorrectly resolved the
+ * image channel (openai) and showed the generic 横屏/竖屏 panel without 1080p.
+ */
 export function isGrok2apiVideoConfig(config: AiConfig | Pick<AiConfig, "model" | "videoModel" | "apiFormat">) {
-    const requestConfig = "channels" in config ? resolveModelRequestConfig(config, config.model || config.videoModel) : config;
-    return requestConfig.apiFormat === "grok2api";
+    const modelValue =
+        ("videoModel" in config && config.videoModel?.trim() ? config.videoModel : undefined) ||
+        ("model" in config ? config.model : undefined) ||
+        "";
+    if ("channels" in config) {
+        const requestConfig = resolveModelRequestConfig(config, modelValue);
+        if (requestConfig.apiFormat === "grok2api") return true;
+    } else if ("apiFormat" in config && config.apiFormat === "grok2api") {
+        return true;
+    }
+    // Channel still on openai but model is official Grok video → use Grok UI/request path.
+    return isGrokImagineVideoModel(modelValue);
 }
 
 export function normalizeGrok2apiVideoRatio(value: string | undefined) {
