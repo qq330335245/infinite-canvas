@@ -50,4 +50,23 @@ export default defineConfig({
         __APP_VERSION__: JSON.stringify(localVersion),
         __APP_RELEASES__: JSON.stringify(parseChangelog(localChangelog)),
     },
+    // Dev HMR: change TS/TSX and refresh in ~seconds. Do NOT use `build` for day-to-day UI work.
+    // When browsing via 盒子 frpc (e.g. :22300), set VITE_HMR_HOST / VITE_HMR_CLIENT_PORT so WS matches.
+    server: {
+        host: process.env.VITE_DEV_HOST || "0.0.0.0",
+        port: Number(process.env.VITE_DEV_PORT || 3000),
+        strictPort: true,
+        hmr: process.env.VITE_HMR_CLIENT_PORT
+            ? {
+                  host: process.env.VITE_HMR_HOST || undefined,
+                  clientPort: Number(process.env.VITE_HMR_CLIENT_PORT),
+                  protocol: (process.env.VITE_HMR_PROTOCOL as "ws" | "wss" | undefined) || "ws",
+              }
+            : undefined,
+    },
+    preview: {
+        host: process.env.VITE_DEV_HOST || "0.0.0.0",
+        port: Number(process.env.VITE_PREVIEW_PORT || 3000),
+        strictPort: true,
+    },
 });

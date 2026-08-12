@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 
 import i18n from "@/i18n";
 import { ImageSettingsTheme } from "@/components/image-settings-panel";
+import { GROK2API_VIDEO_ASPECT_RATIOS, GROK2API_VIDEO_DURATION_OPTIONS, grok2apiVideoResolutionsFor, isGrok2apiVideoConfig, isGrok2apiVideo15, normalizeGrok2apiVideoDuration, normalizeGrok2apiVideoResolution, normalizeGrok2apiVideoRatio } from "@/lib/grok2api";
 import { boolConfig, isSeedanceVideoConfig, normalizeSeedanceDuration, normalizeSeedanceRatio, normalizeSeedanceResolution, seedanceDurationOptions, seedancePixelLabel, seedanceRatioOptions, seedanceResolutionOptions } from "@/lib/seedance-video";
 import { type CanvasTheme } from "@/lib/canvas-theme";
 import { type AiConfig } from "@/stores/use-config-store";
@@ -41,6 +42,9 @@ export function VideoSettingsPanel({ config, onConfigChange, theme, showTitle = 
     const { t } = useTranslation();
     if (isSeedanceVideoConfig(config)) {
         return <SeedanceVideoSettingsPanel config={config} onConfigChange={onConfigChange} theme={theme} showTitle={showTitle} className={className} />;
+    }
+    if (isGrok2apiVideoConfig(config)) {
+        return <Grok2apiVideoSettingsPanel config={config} onConfigChange={onConfigChange} theme={theme} showTitle={showTitle} className={className} />;
     }
 
     const seconds = config.videoSeconds || "6";
@@ -168,14 +172,103 @@ function SeedanceVideoSettingsPanel({ config, onConfigChange, theme, showTitle, 
     );
 }
 
+function Grok2apiVideoSettingsPanel({ config, onConfigChange, theme, showTitle, className }: VideoSettingsPanelProps) {
+    const { t } = useTranslation();
+    const model = config.videoModel || config.model;
+    // Official: 1080p only on grok-imagine-video-1.5 (T2V/I2V). R2V clamp is applied at request time.
+    const resolutionOptions = grok2apiVideoResolutionsFor(model, "t2v");
+    const resolution = normalizeGrok2apiVideoResolution(config.vquality, { model, generateMode: "t2v" });
+    // Keep selection valid when switching away from 1.5.
+    if (config.vquality && !resolutionOptions.includes(resolution) && resolution !== config.vquality) {
+        // no-op render-time; request path clamps. UI highlights nearest allowed.
+    }
+    const sizeValue = (config.size || "").trim();
+    const isAuto = !sizeValue || sizeValue === "auto" || sizeValue === "adaptive";
+    const ratio = isAuto ? "auto" : normalizeGrok2apiVideoRatio(config.size);
+    const duration = normalizeGrok2apiVideoDuration(config.videoSeconds);
+    const show1080Hint = isGrok2apiVideo15(model);
+
+    return (
+        <ImageSettingsTheme theme={theme}>
+            <div className={className} style={{ color: theme.node.text }} onMouseDown={(event) => event.stopPropagation()}>
+                {showTitle ? <div className="text-lg font-semibold">{t("settingsPanels.video.title")}</div> : null}
+                <SettingGroup title={t("settingsPanels.video.resolution")} color={theme.node.muted}>
+                    <div className={`grid gap-2.5 ${resolutionOptions.length >= 3 ? "grid-cols-3" : "grid-cols-2"}`}>
+                        {resolutionOptions.map((value) => (
+                            <OptionPill key={value} selected={resolution === value} theme={theme} onClick={() => onConfigChange("vquality", value)}>
+                                {value}
+                            </OptionPill>
+                        ))}
+                    </div>
+                    <p className="text-[11px] leading-snug opacity-60" style={{ color: theme.node.muted }}>
+                        {show1080Hint
+                            ? t("settingsPanels.video.grokResolutionHint15")
+                            : t("settingsPanels.video.grokResolutionHint")}
+                    </p>
+                </SettingGroup>
+                <SettingGroup title={t("settingsPanels.video.ratio")} color={theme.node.muted}>
+                    <div className="grid grid-cols-3 gap-2.5">
+                        <button
+                            type="button"
+                            className="flex h-[68px] cursor-pointer flex-col items-center justify-center gap-1 rounded-xl border bg-transparent px-1 text-sm transition hover:opacity-80"
+                            style={{ borderColor: isAuto ? theme.node.text : theme.node.stroke, color: theme.node.text }}
+                            onMouseDown={(event) => event.stopPropagation()}
+                            onClick={() => onConfigChange("size", "auto")}
+                        >
+                            <span>{t("settingsPanels.video.adaptive")}</span>
+                            <span className="px-1 text-center text-[10px] leading-tight opacity-55">{t("settingsPanels.video.autoFromFirstFrame")}</span>
+                        </button>
+                        {GROK2API_VIDEO_ASPECT_RATIOS.map((value) => (
+                            <button
+                                key={value}
+                                type="button"
+                                className="flex h-[68px] cursor-pointer flex-col items-center justify-center gap-1 rounded-xl border bg-transparent px-1 text-sm transition hover:opacity-80"
+                                style={{ borderColor: ratio === value ? theme.node.text : theme.node.stroke, color: theme.node.text }}
+                                onMouseDown={(event) => event.stopPropagation()}
+                                onClick={() => onConfigChange("size", value)}
+                            >
+                                <SizePreview width={ratioPreview(value).width} height={ratioPreview(value).height} color={theme.node.text} />
+                                {/* Ratio chips: numeric only (e.g. 2:3); keep 自适应 wording on the auto chip above. */}
+                                <span>{value}</span>
+                            </button>
+                        ))}
+                    </div>
+                    <p className="text-[11px] leading-snug opacity-60" style={{ color: theme.node.muted }}>
+                        {t("settingsPanels.video.grokRatioHint")}
+                    </p>
+                </SettingGroup>
+                <SettingGroup title={t("settingsPanels.video.duration")} color={theme.node.muted}>
+                    <div className="grid grid-cols-4 gap-2.5">
+                        {GROK2API_VIDEO_DURATION_OPTIONS.map((value) => (
+                            <OptionPill key={value} selected={duration === value} theme={theme} onClick={() => onConfigChange("videoSeconds", String(value))}>
+                                {value}s
+                            </OptionPill>
+                        ))}
+                    </div>
+                    <NumberInput value={String(duration)} min={1} max={15} theme={theme} onChange={(value) => onConfigChange("videoSeconds", value)} />
+                    <p className="text-[11px] leading-snug opacity-60" style={{ color: theme.node.muted }}>
+                        {t("settingsPanels.video.grokDurationHint")}
+                    </p>
+                </SettingGroup>
+            </div>
+        </ImageSettingsTheme>
+    );
+}
+
 export function videoResolutionLabel(value: string) {
+    if (/^\d+p$/i.test(value || "")) return value.toLowerCase();
     return `${normalizeVideoResolutionValue(value)}p`;
 }
 
 export function videoSizeLabel(value: string) {
-    const ratio = normalizeSeedanceRatio(value);
     if (value === "adaptive" || value === "auto") return i18n.t("settingsPanels.video.adaptive");
-    if (ratio === value) return i18n.t(`settingsPanels.video.ratios.${seedanceRatioLabelKeys[ratio]}`);
+    if (GROK2API_VIDEO_ASPECT_RATIOS.includes(value as (typeof GROK2API_VIDEO_ASPECT_RATIOS)[number])) {
+        return value;
+    }
+    const seedanceRatio = normalizeSeedanceRatio(value);
+    if (seedanceRatio === value && seedanceRatioLabelKeys[seedanceRatio]) {
+        return i18n.t(`settingsPanels.video.ratios.${seedanceRatioLabelKeys[seedanceRatio]}`);
+    }
     const size = normalizeVideoSizeValue(value);
     const option = sizeOptions.find((item) => item.value === size);
     return option ? i18n.t(`settingsPanels.video.sizes.${option.labelKey}`) : size;
@@ -256,6 +349,8 @@ function ratioPreview(ratio: string) {
     if (ratio === "1:1") return { width: 1, height: 1 };
     if (ratio === "4:3") return { width: 4, height: 3 };
     if (ratio === "3:4") return { width: 3, height: 4 };
+    if (ratio === "3:2") return { width: 3, height: 2 };
+    if (ratio === "2:3") return { width: 2, height: 3 };
     if (ratio === "21:9") return { width: 21, height: 9 };
     if (ratio === "adaptive") return { width: 0, height: 0 };
     return { width: 16, height: 9 };

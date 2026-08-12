@@ -2,7 +2,8 @@ import axios from "axios";
 import { nanoid } from "nanoid";
 
 import i18n from "@/i18n";
-import { dataUrlToFile } from "@/lib/image-utils";
+import { dataUrlToFile, readImageMeta } from "@/lib/image-utils";
+import { GROK2API_VIDEO_REFERENCE_IMAGE_LIMIT, grok2apiVideoAspectRatio, grok2apiVideoAspectRatioFromDimensions, grok2apiVideoDuration, grok2apiVideoExtendDuration, grok2apiVideoResolution, isGrok2apiAutoVideoSize, type Grok2apiVideoGenerateMode, type Grok2apiVideoWorkflow } from "@/lib/grok2api";
 import { getMediaBlob, uploadMediaFile, type UploadedFile } from "@/services/file-storage";
 import { imageToDataUrl } from "@/services/image-storage";
 import { boolConfig, buildSeedancePromptText, isSeedanceVideoConfig, normalizeSeedanceDuration, normalizeSeedanceRatio, normalizeSeedanceResolution, seedanceVideoReferenceError, SEEDANCE_REFERENCE_LIMITS } from "@/lib/seedance-video";
@@ -11,7 +12,7 @@ import { runModelPlugin } from "./model-plugin";
 import type { ReferenceImage } from "@/types/image";
 import type { ReferenceAudio, ReferenceVideo } from "@/types/media";
 
-type VideoResponse = { id: string; status?: string; error?: { message?: string }; url?: string; result_url?: string; video_url?: string; content?: { video_url?: string; url?: string } | null };
+type VideoResponse = { id?: string; request_id?: string; status?: string; progress?: number; model?: string; error?: { message?: string }; url?: string; result_url?: string; video_url?: string; video?: { url?: string } | null; content?: { video_url?: string; url?: string } | null };
 type ApiVideoResponse = VideoResponse | { code?: number | string; data?: VideoResponse | null; msg?: string; message?: string; error?: { message?: string } };
 type SeedanceTask = {
     id: string;
@@ -27,8 +28,11 @@ type RequestOptions = { signal?: AbortSignal };
 const apiText = (key: string, options?: Record<string, unknown>) => i18n.t(`apiErrors.${key}`, options);
 
 export type VideoGenerationResult = { blob?: Blob; url?: string; mimeType?: string };
-export type VideoGenerationTask = { id: string; provider: "openai" | "seedance" | "plugin"; model: string };
-export type VideoGenerationTaskState = { status: "pending" } | { status: "completed"; result: VideoGenerationResult } | { status: "failed"; error: string };
+export type VideoGenerationTask = { id: string; provider: "openai" | "seedance" | "plugin" | "grok2api"; model: string; workflow?: "generate" | "edit" | "extend" };
+export type VideoGenerationTaskState =
+    | { status: "pending"; progress?: number; message?: string }
+    | { status: "completed"; result: VideoGenerationResult }
+    | { status: "failed"; error: string };
 
 /** Results for scripted (plugin) video models, which run their own create+poll in one shot at task creation. */
 const pluginVideoResults = new Map<string, VideoGenerationResult>();
@@ -44,7 +48,7 @@ function aiHeaders(config: AiConfig, contentType?: string) {
     };
 }
 
-export async function requestVideoGeneration(config: AiConfig, prompt: string, references: ReferenceImage[] = [], videoReferences: ReferenceVideo[] = [], audioReferences: ReferenceAudio[] = [], options?: RequestOptions): Promise<VideoGenerationResult> {
+export async function requestVideoGeneration(config: AiConfig, prompt: string, references: ReferenceImage[] = [], videoReferences: ReferenceVideo[] = [], audioReferences: ReferenceAudio[] = [], options?: RequestOptions & { firstFrame?: ReferenceImage | null }): Promise<VideoGenerationResult> {
     const task = await createVideoGenerationTask(config, prompt, references, videoReferences, audioReferences, options);
     const delayMs = task.provider === "seedance" ? 5000 : 2500;
     for (let attempt = 0; attempt < 120; attempt += 1) {
@@ -52,20 +56,29 @@ export async function requestVideoGeneration(config: AiConfig, prompt: string, r
         const state = await pollVideoGenerationTask(config, task, options);
         if (state.status === "completed") return state.result;
         if (state.status === "failed") throw new Error(state.error);
-        if (attempt === 119) throw new Error(apiText("videoTimeout", { provider: task.provider === "seedance" ? "Seedance " : "" }));
+        if (attempt === 119) throw new Error(apiText("videoTimeout", { provider: task.provider === "seedance" ? "Seedance " : task.provider === "grok2api" ? "Grok2API " : "" }));
         await delay(delayMs, options?.signal);
     }
     throw new Error(apiText("videoTimeout", { provider: "" }));
 }
 
-export async function createVideoGenerationTask(config: AiConfig, prompt: string, references: ReferenceImage[] = [], videoReferences: ReferenceVideo[] = [], audioReferences: ReferenceAudio[] = [], options?: RequestOptions): Promise<VideoGenerationTask> {
+export async function createVideoGenerationTask(config: AiConfig, prompt: string, references: ReferenceImage[] = [], videoReferences: ReferenceVideo[] = [], audioReferences: ReferenceAudio[] = [], options?: RequestOptions & { firstFrame?: ReferenceImage | null; workflow?: Grok2apiVideoWorkflow; sourceVideoUrl?: string; sourceVideo?: ReferenceVideo | null }): Promise<VideoGenerationTask> {
     const selectedModel = (config.model || config.videoModel).trim();
     const requestConfig = resolveModelRequestConfig(config, selectedModel);
     const script = resolveModelScript(config, selectedModel);
     if (script) return createPluginVideoTask(requestConfig, selectedModel, script, prompt, references, options);
     assertVideoConfig(requestConfig, requestConfig.model);
     if (isSeedanceVideoConfig(requestConfig)) {
-        return createSeedanceTask(requestConfig, selectedModel, prompt, references, videoReferences, audioReferences, options);
+        // Seedance has no first-frame field; prepend optional first frame into image refs.
+        const seedanceImages = options?.firstFrame ? [options.firstFrame, ...references] : references;
+        return createSeedanceTask(requestConfig, selectedModel, prompt, seedanceImages, videoReferences, audioReferences, options);
+    }
+    if (requestConfig.apiFormat === "grok2api") {
+        const workflow = options?.workflow || "generate";
+        if (workflow === "generate" && (videoReferences.length || audioReferences.length)) {
+            throw new Error(apiText("videoReferencesUnsupported"));
+        }
+        return createGrok2apiVideoTask(requestConfig, selectedModel, prompt, references, options);
     }
     if (videoReferences.length || audioReferences.length) {
         throw new Error(apiText("videoReferencesUnsupported"));
@@ -80,7 +93,9 @@ export async function pollVideoGenerationTask(config: AiConfig, task: VideoGener
     }
     const requestConfig = resolveModelRequestConfig(config, task.model);
     assertVideoConfig(requestConfig, requestConfig.model);
-    return task.provider === "seedance" ? pollSeedanceTask(requestConfig, task, options) : pollOpenAIVideoTask(requestConfig, task, options);
+    if (task.provider === "seedance") return pollSeedanceTask(requestConfig, task, options);
+    if (task.provider === "grok2api") return pollGrok2apiVideoTask(requestConfig, task, options);
+    return pollOpenAIVideoTask(requestConfig, task, options);
 }
 
 async function createPluginVideoTask(config: AiConfig, model: string, script: string, prompt: string, references: ReferenceImage[], options?: RequestOptions): Promise<VideoGenerationTask> {
@@ -132,6 +147,177 @@ export async function storeGeneratedVideo(result: VideoGenerationResult): Promis
         }
     }
     throw new Error(apiText("noPlayableVideo"));
+}
+
+async function createGrok2apiVideoTask(config: AiConfig, model: string, prompt: string, references: ReferenceImage[], options?: RequestOptions & { firstFrame?: ReferenceImage | null; workflow?: Grok2apiVideoWorkflow; sourceVideoUrl?: string; sourceVideo?: ReferenceVideo | null }): Promise<VideoGenerationTask> {
+    const workflow: Grok2apiVideoWorkflow = options?.workflow || "generate";
+    if (workflow === "edit" || workflow === "extend") {
+        return createGrok2apiVideoMutationTask(config, model, prompt, workflow, options);
+    }
+    const firstFrame = options?.firstFrame || null;
+    // Official xAI rule: `image` and `reference_images` are mutually exclusive (400 if both are set).
+    // Prefer explicit first-frame image-to-video when both are provided; never auto-promote refs to first frame.
+    const useFirstFrame = Boolean(firstFrame);
+    const firstFrameUrl = useFirstFrame ? await imageToDataUrl(firstFrame!) : "";
+    const referenceUrls = useFirstFrame
+        ? []
+        : (await Promise.all(references.slice(0, GROK2API_VIDEO_REFERENCE_IMAGE_LIMIT).map((image) => imageToDataUrl(image)))).filter(Boolean);
+    const promptText = prompt.trim();
+    const generateMode: Grok2apiVideoGenerateMode = firstFrameUrl ? "i2v" : referenceUrls.length ? "r2v" : "t2v";
+
+    const aspectRatio = await resolveGrok2apiVideoAspectRatio(config.size, firstFrameUrl || undefined);
+    // Shape: model/prompt/duration/aspect_ratio/resolution + either image XOR reference_images.
+    // Strict JSON rejects unknown fields such as n / images / seconds / size / quality.
+    const payload: Record<string, unknown> = {
+        model: modelOptionName(model),
+        aspect_ratio: aspectRatio,
+        resolution: grok2apiVideoResolution(config.vquality, { model, generateMode }),
+        duration: grok2apiVideoDuration(config.videoSeconds),
+    };
+    if (promptText) payload.prompt = promptText;
+    if (firstFrameUrl) payload.image = { url: firstFrameUrl };
+    else if (referenceUrls.length) payload.reference_images = referenceUrls.map((url) => ({ url }));
+    if (!promptText && !firstFrameUrl && !referenceUrls.length) throw new Error(apiText("videoPromptRequired"));
+    try {
+        const created = unwrapVideoResponse((await axios.post<ApiVideoResponse>(aiApiUrl(config, "/videos/generations"), payload, { headers: aiHeaders(config, "application/json"), signal: options?.signal })).data);
+        const id = created.id || created.request_id;
+        if (!id) throw new Error(apiText("noVideoTaskId"));
+        return { id, provider: "grok2api", model, workflow: "generate" };
+    } catch (error) {
+        throw new Error(readAxiosError(error, apiText("videoTaskCreateFailed")));
+    }
+}
+
+async function createGrok2apiVideoMutationTask(
+    config: AiConfig,
+    model: string,
+    prompt: string,
+    workflow: "edit" | "extend",
+    options?: RequestOptions & { sourceVideoUrl?: string; sourceVideo?: ReferenceVideo | null },
+): Promise<VideoGenerationTask> {
+    const promptText = prompt.trim();
+    if (!promptText) throw new Error(apiText("videoPromptRequired"));
+    // Local uploads are stored as blob: object URLs — servers cannot fetch those.
+    // Resolve storageKey/blob to a data URL (or keep https) before POST.
+    const sourceUrl = await resolveGrok2apiSourceVideoUrl(options?.sourceVideo || { url: options?.sourceVideoUrl || "" });
+    // Official Console edit/extend only accept grok-imagine-video (not 1.5) today.
+    const rawModel = modelOptionName(model).replace(/^Console\//i, "");
+    const editModel = /grok-imagine-video/i.test(rawModel) ? "grok-imagine-video" : rawModel;
+    const payload: Record<string, unknown> = {
+        model: editModel,
+        prompt: promptText,
+        video: { url: sourceUrl },
+    };
+    if (workflow === "extend") {
+        payload.duration = grok2apiVideoExtendDuration(config.videoSeconds);
+    }
+    const path = workflow === "edit" ? "/videos/edits" : "/videos/extensions";
+    try {
+        const created = unwrapVideoResponse((await axios.post<ApiVideoResponse>(aiApiUrl(config, path), payload, { headers: aiHeaders(config, "application/json"), signal: options?.signal })).data);
+        const id = created.id || created.request_id;
+        if (!id) throw new Error(apiText("noVideoTaskId"));
+        return { id, provider: "grok2api", model, workflow };
+    } catch (error) {
+        throw new Error(readAxiosError(error, apiText("videoTaskCreateFailed")));
+    }
+}
+
+async function resolveGrok2apiVideoAspectRatio(size: string | undefined, firstFrameDataUrl?: string) {
+    // With a first frame + auto size, match the frame so upstream does not squash it to 16:9.
+    if (isGrok2apiAutoVideoSize(size) && firstFrameDataUrl) {
+        try {
+            const meta = await readImageMeta(firstFrameDataUrl);
+            return grok2apiVideoAspectRatioFromDimensions(meta.width, meta.height);
+        } catch {
+            return "16:9";
+        }
+    }
+    // API requires a concrete ratio (empty/auto not accepted); default 16:9 without a frame.
+    if (isGrok2apiAutoVideoSize(size)) return "16:9";
+    return grok2apiVideoAspectRatio(size);
+}
+
+async function pollGrok2apiVideoTask(config: AiConfig, task: VideoGenerationTask, options?: RequestOptions): Promise<VideoGenerationTaskState> {
+    try {
+        const video = unwrapVideoResponse((await axios.get<ApiVideoResponse>(aiApiUrl(config, `/videos/${encodeURIComponent(task.id)}`), { headers: aiHeaders(config), signal: options?.signal })).data);
+        const status = (video.status || "").toLowerCase();
+        const rawUrl = videoResultUrl(video);
+        const progress = typeof video.progress === "number" && Number.isFinite(video.progress) ? Math.max(0, Math.min(100, Math.floor(video.progress))) : undefined;
+        const terminalSuccess = status === "done" || status === "completed" || status === "succeeded" || status === "success" || Boolean(rawUrl);
+        if (status === "failed" || status === "cancelled" || status === "canceled" || status === "expired") {
+            return { status: "failed", error: readApiErrorMessage(video.error?.message) || apiText("videoGenerationFailed") };
+        }
+        if (!terminalSuccess) {
+            return {
+                status: "pending",
+                progress,
+                message: status || "pending",
+            };
+        }
+
+        // Content endpoints always need the client API key. Prefer the poll URL when it is already public,
+        // but always attach Authorization — bare browser/open-tab access returns invalid_api_key.
+        const preferredUrl = rewriteGrok2apiMediaUrl(config, rawUrl) || aiApiUrl(config, `/videos/${encodeURIComponent(task.id)}/content`);
+        try {
+            return { status: "completed", result: await downloadGrok2apiVideoContent(config, preferredUrl, options) };
+        } catch (contentError) {
+            if (axios.isCancel(contentError) || options?.signal?.aborted) throw contentError;
+            const fallbackUrl = aiApiUrl(config, `/videos/${encodeURIComponent(task.id)}/content`);
+            if (fallbackUrl !== preferredUrl) {
+                try {
+                    return { status: "completed", result: await downloadGrok2apiVideoContent(config, fallbackUrl, options) };
+                } catch (fallbackError) {
+                    if (axios.isCancel(fallbackError) || options?.signal?.aborted) throw fallbackError;
+                    throw new Error(readAxiosError(fallbackError, apiText("videoDownloadFailed")));
+                }
+            }
+            throw new Error(readAxiosError(contentError, apiText("videoDownloadFailed")));
+        }
+    } catch (error) {
+        throw new Error(readAxiosError(error, apiText("videoTaskQueryFailed")));
+    }
+}
+
+async function downloadGrok2apiVideoContent(config: AiConfig, url: string, options?: RequestOptions): Promise<VideoGenerationResult> {
+    // Always send Bearer for Grok media — /videos/*/content is auth-gated even on a public HTTPS host.
+    const response = await axios.get<Blob>(url, {
+        responseType: "blob",
+        signal: options?.signal,
+        headers: aiHeaders(config),
+    });
+    await assertVideoBlob(response.data);
+    if (!response.data || response.data.size <= 0) throw new Error(apiText("noPlayableVideo"));
+    return { blob: response.data, mimeType: response.data.type || "video/mp4" };
+}
+
+/** Map poll media URLs onto the channel baseUrl; rewrite loopback publicApiBaseURL leftovers. */
+function rewriteGrok2apiMediaUrl(config: AiConfig, value?: string) {
+    if (!value) return undefined;
+    if (value.startsWith("data:")) return value;
+    if (value.startsWith("/")) {
+        const apiPath = value.replace(/^\/v1(?=\/)/, "") || value;
+        return aiApiUrl(config, apiPath.startsWith("/") ? apiPath : `/${apiPath}`);
+    }
+    if (!isPublicMediaUrl(value)) return value;
+    try {
+        const parsed = new URL(value);
+        if (isLoopbackHostname(parsed.hostname) || isGrok2apiContentPath(parsed.pathname)) {
+            const path = parsed.pathname.replace(/^\/v1(?=\/)/, "") + parsed.search + parsed.hash;
+            return aiApiUrl(config, path.startsWith("/") ? path : `/${path}`);
+        }
+        return value;
+    } catch {
+        return value;
+    }
+}
+
+function isGrok2apiContentPath(pathname: string) {
+    return /(?:^|\/)(?:v1\/)?videos\/[^/]+\/content\/?$/i.test(pathname || "");
+}
+
+function isLoopbackHostname(hostname: string) {
+    const host = (hostname || "").toLowerCase();
+    return host === "localhost" || host === "127.0.0.1" || host === "0.0.0.0" || host === "::1" || host === "[::1]";
 }
 
 async function createOpenAIVideoTask(config: AiConfig, model: string, prompt: string, references: ReferenceImage[], options?: RequestOptions): Promise<VideoGenerationTask> {
@@ -269,6 +455,45 @@ async function resolveSeedanceVideoUrl(video: ReferenceVideo) {
     return blobToDataUrl(blob);
 }
 
+/** Grok2API edit/extend video.url must be HTTPS or a video data URL — never browser blob:. */
+async function resolveGrok2apiSourceVideoUrl(video: { url?: string; storageKey?: string; bytes?: number; type?: string }) {
+    const url = (video.url || "").trim();
+    if (!url && !video.storageKey) throw new Error(apiText("invalidReferenceVideo"));
+    if (url.startsWith("data:video/") && url.includes(";base64,")) return url;
+    if (isPublicMediaUrl(url)) return url;
+    // ~32 MiB gateway body limit; base64 expands ~4/3, leave headroom for JSON fields.
+    const maxRawBytes = 20 * 1024 * 1024;
+    if (typeof video.bytes === "number" && video.bytes > maxRawBytes) throw new Error(apiText("sourceVideoTooLarge"));
+    let blob: Blob | null = null;
+    if (video.storageKey) blob = await getMediaBlob(video.storageKey);
+    if (!blob && url.startsWith("blob:")) {
+        try {
+            blob = await (await fetch(url)).blob();
+        } catch {
+            blob = null;
+        }
+    }
+    if (!blob && url && !url.startsWith("blob:")) {
+        try {
+            blob = await (await fetch(url)).blob();
+        } catch {
+            blob = null;
+        }
+    }
+    if (!blob) throw new Error(apiText("invalidReferenceVideo"));
+    if (blob.size > maxRawBytes) throw new Error(apiText("sourceVideoTooLarge"));
+    const dataUrl = await blobToDataUrl(blob);
+    if (!dataUrl.startsWith("data:video/") && !dataUrl.startsWith("data:application/octet-stream")) {
+        // Some browsers report empty type on stored blobs; force video/mp4 data URL prefix if needed.
+        if (dataUrl.startsWith("data:") && dataUrl.includes(";base64,")) {
+            const b64 = dataUrl.split(";base64,")[1] || "";
+            return `data:${video.type || blob.type || "video/mp4"};base64,${b64}`;
+        }
+        throw new Error(apiText("invalidReferenceVideo"));
+    }
+    return dataUrl;
+}
+
 async function resolveSeedanceAudioUrl(audio: ReferenceAudio) {
     if (isPublicMediaUrl(audio.url) || audio.url.startsWith("asset://")) return audio.url;
     let blob: Blob | null = null;
@@ -334,7 +559,12 @@ function unwrapEnvelope<T>(payload: ApiEnvelope<T>, emptyMessage: string): T {
 }
 
 function videoResultUrl(payload: VideoResponse | SeedanceTask) {
-    return [payload.video_url, payload.result_url, payload.url, payload.content?.video_url, payload.content?.url].find((url) => typeof url === "string" && (isPublicMediaUrl(url) || /\.mp4(\?|#|$)/i.test(url)));
+    const videoUrl = "video" in payload ? payload.video?.url : undefined;
+    return [payload.video_url, payload.result_url, payload.url, videoUrl, payload.content?.video_url, payload.content?.url].find((url) => typeof url === "string" && isPlayableOrContentUrl(url));
+}
+
+function isPlayableOrContentUrl(url: string) {
+    return isPublicMediaUrl(url) || /\.mp4(\?|#|$)/i.test(url) || url.startsWith("data:") || /\/videos\/[^/]+\/content(?:\?|#|$)/i.test(url) || url.startsWith("/v1/videos/") || url.startsWith("/videos/");
 }
 
 function readApiErrorMessage(value: unknown): string {

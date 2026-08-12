@@ -1,0 +1,88 @@
+# One-shot: build on GitHub runners → deploy Cloudflare Pages (project: infinite-canvas).
+# Local p30 does not run vite build.
+#
+# Required repo Secrets (Settings → Secrets and variables → Actions):
+#   CLOUDFLARE_API_TOKEN   — Pages Edit (or Account API token with Pages write)
+#   CLOUDFLARE_ACCOUNT_ID  — CF account id
+#
+# Manual: Actions → Deploy Infinite Canvas → Run workflow
+name: Deploy Infinite Canvas
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "web/**"
+      - "wrangler.toml"
+      - ".github/workflows/deploy-infinite-canvas.yml"
+  pull_request:
+    paths:
+      - "web/**"
+      - "wrangler.toml"
+      - ".github/workflows/deploy-infinite-canvas.yml"
+
+permissions:
+  contents: read
+  deployments: write
+
+concurrency:
+  group: deploy-infinite-canvas-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        working-directory: web
+        run: bun install --frozen-lockfile || bun install
+
+      - name: Build
+        working-directory: web
+        env:
+          VITE_BASE: /
+        run: bun run build
+
+      - name: SPA fallback
+        run: |
+          cp web/dist/index.html web/dist/404.html
+          # Cloudflare Pages SPA: public/_redirects is copied by Vite if present
+          test -f web/dist/_redirects || printf '%s\n' '/*    /index.html   200' > web/dist/_redirects
+
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: infinite-canvas-web-dist
+          path: web/dist
+          if-no-files-found: error
+          retention-days: 14
+
+  deploy:
+    # Only production/main (and manual). PRs build artifact only.
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: cloudflare-pages
+      url: https://i-canvas.konsin.de5.net
+    steps:
+      - name: Download dist
+        uses: actions/download-artifact@v4
+        with:
+          name: infinite-canvas-web-dist
+          path: web/dist
+
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # Project name must be infinite-canvas (not infinite-canvas-a3o).
+          command: pages deploy web/dist --project-name=infinite-canvas --commit-dirty=true

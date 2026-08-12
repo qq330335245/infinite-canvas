@@ -12,6 +12,7 @@ import { PromptSelectDialog } from "@/components/prompts/prompt-select-dialog";
 import { VideoSettingsPanel, normalizeVideoResolutionValue, normalizeVideoSizeValue, videoSizeLabel } from "@/components/video-settings-panel";
 import { canvasThemes } from "@/lib/canvas-theme";
 import { formatBytes, formatDuration } from "@/lib/image-utils";
+import { GROK2API_VIDEO_EXTEND_DURATION_OPTIONS, GROK2API_VIDEO_REFERENCE_IMAGE_LIMIT, isGrok2apiVideoConfig, normalizeGrok2apiVideoDuration, normalizeGrok2apiVideoResolution, normalizeGrok2apiVideoRatio, type Grok2apiVideoWorkflow } from "@/lib/grok2api";
 import { boolConfig, isSeedanceVideoConfig, normalizeSeedanceRatio, seedanceReferenceLabel, seedanceVideoReferenceError, seedanceVideoReferenceHint, SEEDANCE_REFERENCE_LIMITS, SEEDANCE_VIDEO_MIME_TYPES } from "@/lib/seedance-video";
 import { deleteStoredMedia, resolveMediaUrl, uploadMediaFile } from "@/services/file-storage";
 import { resolveImageUrl, uploadImage } from "@/services/image-storage";
@@ -38,6 +39,9 @@ type GeneratedVideo = {
 type GenerationResult = {
     id: string;
     status: "pending" | "success" | "failed";
+    /** Upstream job progress 0–100 when available (Grok2API poll). */
+    progress?: number;
+    statusMessage?: string;
     video?: GeneratedVideo;
     error?: string;
 };
@@ -50,6 +54,9 @@ type GenerationLog = {
     time: string;
     model: string;
     config: GenerationLogConfig;
+    /** Optional Grok first-frame (image field). */
+    firstFrame?: ReferenceImage | null;
+    /** Reference images only (Grok reference_images / Seedance refs). */
     references: ReferenceImage[];
     videoReferences: ReferenceVideo[];
     audioReferences: ReferenceAudio[];
@@ -74,6 +81,7 @@ export default function VideoPage() {
     const { message } = App.useApp();
     const { t } = useTranslation();
     const fileInputRef = useRef<HTMLInputElement>(null);
+    const uploadTargetRef = useRef<"firstFrame" | "image" | "video" | "audio">("image");
     const dragDepthRef = useRef(0);
     const activeLogIdsRef = useRef<Set<string>>(new Set());
     const config = useConfigStore((state) => state.config);
@@ -83,9 +91,14 @@ export default function VideoPage() {
     const openConfigDialog = useConfigStore((state) => state.openConfigDialog);
     const addAsset = useAssetStore((state) => state.addAsset);
     const [prompt, setPrompt] = useState("");
+    const [firstFrame, setFirstFrame] = useState<ReferenceImage | null>(null);
     const [references, setReferences] = useState<ReferenceImage[]>([]);
     const [videoReferences, setVideoReferences] = useState<ReferenceVideo[]>([]);
     const [audioReferences, setAudioReferences] = useState<ReferenceAudio[]>([]);
+    /** Grok2API workflow: generate | edit | extend (official endpoints). */
+    const [grokWorkflow, setGrokWorkflow] = useState<Grok2apiVideoWorkflow>("generate");
+    /** Source clip for edit/extend (public URL or data URL after upload). */
+    const [sourceVideo, setSourceVideo] = useState<ReferenceVideo | null>(null);
     const [results, setResults] = useState<GenerationResult[]>([]);
     const [logs, setLogs] = useState<GenerationLog[]>([]);
     const [running, setRunning] = useState(false);
@@ -98,7 +111,7 @@ export default function VideoPage() {
     const [selectedLogIds, setSelectedLogIds] = useState<string[]>([]);
     const [previewLog, setPreviewLog] = useState<GenerationLog | null>(null);
     const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
-    const [referenceDragTarget, setReferenceDragTarget] = useState<"image" | "video" | "audio" | null>(null);
+    const [referenceDragTarget, setReferenceDragTarget] = useState<"firstFrame" | "image" | "video" | "audio" | null>(null);
     const [autoRunToken, setAutoRunToken] = useState(0);
     const videoCommand = useWorkbenchAgentStore((state) => state.videoCommand);
     const clearVideoCommand = useWorkbenchAgentStore((state) => state.clearVideoCommand);
@@ -107,7 +120,12 @@ export default function VideoPage() {
     const agentTaskIdRef = useRef<string | undefined>(undefined);
 
     const model = effectiveConfig.videoModel || effectiveConfig.model;
-    const canGenerate = Boolean(prompt.trim());
+    const seedanceMode = isSeedanceVideoConfig({ ...effectiveConfig, model });
+    const grok2apiMode = isGrok2apiVideoConfig({ ...effectiveConfig, model });
+    // Image-to-video / reference-only can omit prompt on Grok2API generate; edit/extend always need prompt + source video.
+    const canGenerate = grok2apiMode && grokWorkflow !== "generate"
+        ? Boolean(prompt.trim() && sourceVideo?.url)
+        : Boolean(prompt.trim() || (grok2apiMode && (firstFrame || references.length)));
 
     useEffect(() => {
         if (!running || !startedAt) return;
@@ -119,11 +137,32 @@ export default function VideoPage() {
         void refreshLogs();
     }, []);
 
-    const addReferences = async (files?: FileList | null) => {
+    const addReferences = async (files?: FileList | null, target: "firstFrame" | "image" | "video" | "audio" = "image") => {
         const selectedFiles = Array.from(files || []);
         const unsupported = selectedFiles.filter((file) => !file.type.startsWith("image/") && !SEEDANCE_VIDEO_MIME_TYPES.includes(file.type) && !isSupportedAudioFile(file));
         if (unsupported.length) message.warning(t("videoWorkbench.unsupportedFiles"));
-        const imageFiles = selectedFiles.filter((file) => file.type.startsWith("image/") && file.size <= SEEDANCE_REFERENCE_LIMITS.imageMaxBytes).slice(0, SEEDANCE_REFERENCE_LIMITS.images - references.length);
+        const imageLimit = referenceImageLimit(effectiveConfig, model);
+        if (target === "firstFrame") {
+            const imageFile = selectedFiles.find((file) => file.type.startsWith("image/") && file.size <= SEEDANCE_REFERENCE_LIMITS.imageMaxBytes);
+            if (!imageFile) {
+                if (selectedFiles.some((file) => file.type.startsWith("image/"))) message.warning(t("videoWorkbench.imageTooLarge"));
+                return;
+            }
+            const image = await uploadImage(imageFile);
+            // Official: image XOR reference_images — setting first frame drops refs.
+            if (grok2apiMode && references.length) {
+                setReferences([]);
+                message.warning(t("videoWorkbench.firstFrameClearsReferences"));
+            }
+            setFirstFrame({ id: nanoid(), name: imageFile.name, type: image.mimeType, dataUrl: image.url, storageKey: image.storageKey });
+            return;
+        }
+        // Official: cannot send image + reference_images. Prefer clearing first frame when adding refs.
+        if (grok2apiMode && firstFrame && selectedFiles.some((file) => file.type.startsWith("image/"))) {
+            setFirstFrame(null);
+            message.warning(t("videoWorkbench.referencesClearsFirstFrame"));
+        }
+        const imageFiles = selectedFiles.filter((file) => file.type.startsWith("image/") && file.size <= SEEDANCE_REFERENCE_LIMITS.imageMaxBytes).slice(0, imageLimit - references.length);
         const videoFiles = selectedFiles.filter((file) => SEEDANCE_VIDEO_MIME_TYPES.includes(file.type) && file.size <= SEEDANCE_REFERENCE_LIMITS.videoMaxBytes).slice(0, SEEDANCE_REFERENCE_LIMITS.videos - videoReferences.length);
         const audioFiles = selectedFiles.filter((file) => isSupportedAudioFile(file) && file.size <= SEEDANCE_REFERENCE_LIMITS.audioMaxBytes).slice(0, SEEDANCE_REFERENCE_LIMITS.audios - audioReferences.length);
         if (selectedFiles.some((file) => file.type.startsWith("image/") && file.size > SEEDANCE_REFERENCE_LIMITS.imageMaxBytes)) message.warning(t("videoWorkbench.imageTooLarge"));
@@ -151,12 +190,17 @@ export default function VideoPage() {
             ),
             message.warning,
         );
-        setReferences((value) => [...value, ...nextReferences].slice(0, SEEDANCE_REFERENCE_LIMITS.images));
-        setVideoReferences((value) => [...value, ...nextVideoReferences].slice(0, SEEDANCE_REFERENCE_LIMITS.videos));
+        setReferences((value) => [...value, ...nextReferences].slice(0, imageLimit));
+        if (grok2apiMode && (grokWorkflow === "edit" || grokWorkflow === "extend") && nextVideoReferences.length) {
+            // Edit/extend take a single source clip (official video.url).
+            setSourceVideo(nextVideoReferences[0]);
+        } else {
+            setVideoReferences((value) => [...value, ...nextVideoReferences].slice(0, SEEDANCE_REFERENCE_LIMITS.videos));
+        }
         setAudioReferences((value) => [...value, ...nextAudioReferences].slice(0, SEEDANCE_REFERENCE_LIMITS.audios));
     };
 
-    const handleReferenceDragEnter = (event: DragEvent<HTMLDivElement>, target: "image" | "video" | "audio") => {
+    const handleReferenceDragEnter = (event: DragEvent<HTMLDivElement>, target: "firstFrame" | "image" | "video" | "audio") => {
         event.preventDefault();
         dragDepthRef.current += 1;
         if (event.dataTransfer.types.includes("Files")) setReferenceDragTarget(target);
@@ -168,14 +212,14 @@ export default function VideoPage() {
         if (!dragDepthRef.current) setReferenceDragTarget(null);
     };
 
-    const handleReferenceDrop = (event: DragEvent<HTMLDivElement>) => {
+    const handleReferenceDrop = (event: DragEvent<HTMLDivElement>, target: "firstFrame" | "image" | "video" | "audio" = "image") => {
         event.preventDefault();
         dragDepthRef.current = 0;
         setReferenceDragTarget(null);
-        void addReferences(event.dataTransfer.files);
+        void addReferences(event.dataTransfer.files, target);
     };
 
-    const addReferencesFromClipboard = async () => {
+    const addReferencesFromClipboard = async (target: "firstFrame" | "image" = "image") => {
         try {
             const items = await navigator.clipboard.read();
             const blobs = await Promise.all(items.flatMap((item) => item.types.filter((type) => type.startsWith("image/")).map((type) => item.getType(type))));
@@ -183,13 +227,28 @@ export default function VideoPage() {
                 message.error(t("videoWorkbench.clipboardEmpty"));
                 return;
             }
+            if (target === "firstFrame") {
+                const image = await uploadImage(blobs[0]);
+                if (grok2apiMode && references.length) {
+                    setReferences([]);
+                    message.warning(t("videoWorkbench.firstFrameClearsReferences"));
+                }
+                setFirstFrame({ id: nanoid(), name: "clipboard-first-frame.png", type: image.mimeType, dataUrl: image.url, storageKey: image.storageKey });
+                message.success(t("videoWorkbench.clipboardAdded", { count: 1 }));
+                return;
+            }
+            const imageLimit = referenceImageLimit(effectiveConfig, model);
+            if (grok2apiMode && firstFrame && blobs.length) {
+                setFirstFrame(null);
+                message.warning(t("videoWorkbench.referencesClearsFirstFrame"));
+            }
             const nextReferences = await Promise.all(
-                blobs.slice(0, SEEDANCE_REFERENCE_LIMITS.images - references.length).map(async (blob, index) => {
+                blobs.slice(0, imageLimit - references.length).map(async (blob, index) => {
                     const image = await uploadImage(blob);
                     return { id: nanoid(), name: `clipboard-${index + 1}.png`, type: image.mimeType, dataUrl: image.url, storageKey: image.storageKey };
                 }),
             );
-            setReferences((value) => [...value, ...nextReferences].slice(0, SEEDANCE_REFERENCE_LIMITS.images));
+            setReferences((value) => [...value, ...nextReferences].slice(0, imageLimit));
             message.success(t("videoWorkbench.clipboardAdded", { count: nextReferences.length }));
         } catch {
             message.error(t("videoWorkbench.clipboardEmpty"));
@@ -211,15 +270,20 @@ export default function VideoPage() {
         const batchStartedAt = performance.now();
         setStartedAt(batchStartedAt);
         try {
-            const task = await createVideoGenerationTask(snapshot.config, snapshot.text, snapshot.references, snapshot.videoReferences, snapshot.audioReferences);
-            const log = buildLog({ prompt: snapshot.text, model, config: snapshot.config, references: snapshot.references, videoReferences: snapshot.videoReferences, audioReferences: snapshot.audioReferences, durationMs: 0, status: "pending", task });
+            const task = await createVideoGenerationTask(snapshot.config, snapshot.text, snapshot.references, snapshot.videoReferences, snapshot.audioReferences, {
+                firstFrame: snapshot.firstFrame,
+                workflow: snapshot.workflow,
+                sourceVideoUrl: snapshot.sourceVideoUrl,
+                sourceVideo: snapshot.sourceVideo,
+            });
+            const log = buildLog({ prompt: snapshot.text, model, config: snapshot.config, firstFrame: snapshot.firstFrame, references: snapshot.references, videoReferences: snapshot.videoReferences, audioReferences: snapshot.audioReferences, durationMs: 0, status: "pending", task });
             await saveLog(log, false);
             void pollGenerationLog(log, snapshot.config, agentTaskId);
         } catch (error) {
             const errorMessage = error instanceof Error ? error.message : t("workbench.generationFailed");
             setResults([{ id: nanoid(), status: "failed", error: errorMessage }]);
             if (agentTaskId) updateAgentTask(agentTaskId, { status: "failed", successCount: 0, failCount: 1, error: errorMessage });
-            await saveLog(buildLog({ prompt: snapshot.text, model, config: snapshot.config, references: snapshot.references, videoReferences: snapshot.videoReferences, audioReferences: snapshot.audioReferences, durationMs: performance.now() - batchStartedAt, status: "failed", error: errorMessage }));
+            await saveLog(buildLog({ prompt: snapshot.text, model, config: snapshot.config, firstFrame: snapshot.firstFrame, references: snapshot.references, videoReferences: snapshot.videoReferences, audioReferences: snapshot.audioReferences, durationMs: performance.now() - batchStartedAt, status: "failed", error: errorMessage }));
             message.error(errorMessage);
             setRunning(false);
         }
@@ -249,7 +313,17 @@ export default function VideoPage() {
 
     const buildRequestSnapshot = () => {
         const text = prompt.trim();
-        if (!text) {
+        const workflow: Grok2apiVideoWorkflow = grok2apiMode ? grokWorkflow : "generate";
+        if (grok2apiMode && (workflow === "edit" || workflow === "extend")) {
+            if (!text) {
+                message.error(t("videoWorkbench.promptRequired"));
+                return null;
+            }
+            if (!sourceVideo?.url) {
+                message.error(t("videoWorkbench.sourceVideoRequired"));
+                return null;
+            }
+        } else if (!text && !(grok2apiMode && (firstFrame || references.length))) {
             message.error(t("videoWorkbench.promptRequired"));
             return null;
         }
@@ -258,12 +332,38 @@ export default function VideoPage() {
             openConfigDialog(true);
             return null;
         }
-        const videoReferenceError = seedanceVideoReferenceError(videoReferences);
-        if (videoReferenceError) {
-            message.error(t("videoWorkbench.referenceError", { error: videoReferenceError, hint: seedanceVideoReferenceHint() }));
-            return null;
+        if (workflow === "generate" && (videoReferences.length || audioReferences.length)) {
+            if (!seedanceMode) {
+                message.error(t("apiErrors.videoReferencesUnsupported"));
+                return null;
+            }
+            const videoReferenceError = seedanceVideoReferenceError(videoReferences);
+            if (videoReferenceError) {
+                message.error(t("videoWorkbench.referenceError", { error: videoReferenceError, hint: seedanceVideoReferenceHint() }));
+                return null;
+            }
         }
-        return { text, config: buildVideoConfig(effectiveConfig, model), references: [...references], videoReferences: [...videoReferences], audioReferences: [...audioReferences] };
+        // Official Grok: image and reference_images cannot both be sent. Prefer first frame for the request.
+        let requestFirstFrame = grok2apiMode && workflow === "generate" ? firstFrame : null;
+        let requestReferences = grok2apiMode && workflow === "generate" ? [...references] : firstFrame ? [firstFrame, ...references] : [...references];
+        if (grok2apiMode && workflow === "generate" && requestFirstFrame && requestReferences.length) {
+            requestReferences = [];
+            message.warning(t("videoWorkbench.firstFrameClearsReferences"));
+            setReferences([]);
+        }
+        return {
+            text,
+            config: buildVideoConfig(effectiveConfig, model),
+            firstFrame: requestFirstFrame,
+            // Non-Grok paths historically mixed everything into references; keep that for Seedance/OpenAI.
+            references: requestReferences,
+            videoReferences: seedanceMode ? [...videoReferences] : [],
+            audioReferences: seedanceMode ? [...audioReferences] : [],
+            workflow,
+            sourceVideoUrl: workflow === "edit" || workflow === "extend" ? sourceVideo?.url : undefined,
+            // Pass full source video so API layer can resolve blob:/storageKey → data URL.
+            sourceVideo: workflow === "edit" || workflow === "extend" ? sourceVideo : undefined,
+        };
     };
 
     const retryResult = () => {
@@ -292,18 +392,29 @@ export default function VideoPage() {
             setPrompt(payload.content);
         } else if (payload.kind === "image") {
             const stored = await uploadImage(payload.dataUrl);
-            setReferences((value) => [...value, { id: nanoid(), name: payload.title, type: stored.mimeType, dataUrl: stored.url, storageKey: stored.storageKey }].slice(0, SEEDANCE_REFERENCE_LIMITS.images));
+            if (grok2apiMode && firstFrame) {
+                setFirstFrame(null);
+                message.warning(t("videoWorkbench.referencesClearsFirstFrame"));
+            }
+            setReferences((value) => [...value, { id: nanoid(), name: payload.title, type: stored.mimeType, dataUrl: stored.url, storageKey: stored.storageKey }].slice(0, referenceImageLimit(effectiveConfig, model)));
         } else if (payload.kind === "video") {
-            setVideoReferences((value) => [...value, { id: nanoid(), name: payload.title, type: "video/mp4", url: payload.url, storageKey: payload.storageKey, width: payload.width, height: payload.height }].slice(0, SEEDANCE_REFERENCE_LIMITS.videos));
+            const nextVideo = { id: nanoid(), name: payload.title, type: "video/mp4", url: payload.url, storageKey: payload.storageKey, width: payload.width, height: payload.height };
+            if (grok2apiMode && (grokWorkflow === "edit" || grokWorkflow === "extend")) {
+                setSourceVideo(nextVideo);
+            } else {
+                setVideoReferences((value) => [...value, nextVideo].slice(0, SEEDANCE_REFERENCE_LIMITS.videos));
+            }
         }
         setAssetPickerOpen(false);
     };
 
     const createSession = () => {
         setPrompt("");
+        setFirstFrame(null);
         setReferences([]);
         setVideoReferences([]);
         setAudioReferences([]);
+        setSourceVideo(null);
         setResults([]);
         setElapsedMs(0);
         setStartedAt(0);
@@ -372,6 +483,9 @@ export default function VideoPage() {
                     return;
                 }
                 if (state.status === "failed") throw new Error(state.error);
+                if (state.status === "pending") {
+                    setResults([{ id: log.id, status: "pending", progress: state.progress, statusMessage: state.message }]);
+                }
                 if (attempt === 119) throw new Error(t("videoWorkbench.timeout"));
                 await delay(log.task.provider === "seedance" ? 5000 : 2500);
             }
@@ -394,6 +508,7 @@ export default function VideoPage() {
         setPreviewLog(log);
         setLogsOpen(false);
         setPrompt(log.prompt);
+        setFirstFrame(log.firstFrame || null);
         setReferences(log.references || []);
         setVideoReferences(log.videoReferences || []);
         setAudioReferences(log.audioReferences || []);
@@ -428,6 +543,75 @@ export default function VideoPage() {
                         </div>
 
                         <div className="mt-6 space-y-5">
+                            {grok2apiMode ? (
+                                <div>
+                                    <div className="mb-2 text-base font-semibold">{t("videoWorkbench.workflow")}</div>
+                                    <div className="flex flex-wrap gap-2">
+                                        {(["generate", "edit", "extend"] as const).map((mode) => (
+                                            <Button
+                                                key={mode}
+                                                type={grokWorkflow === mode ? "primary" : "default"}
+                                                size="small"
+                                                onClick={() => setGrokWorkflow(mode)}
+                                            >
+                                                {t(`videoWorkbench.workflows.${mode}`)}
+                                            </Button>
+                                        ))}
+                                    </div>
+                                    <div className="mt-2 text-xs text-stone-500 dark:text-stone-400">{t(`videoWorkbench.workflowHints.${grokWorkflow}`)}</div>
+                                </div>
+                            ) : null}
+
+                            {grok2apiMode && (grokWorkflow === "edit" || grokWorkflow === "extend") ? (
+                                <div className="min-w-0">
+                                    <div className="mb-2 flex items-center justify-between gap-3">
+                                        <span className="text-base font-semibold">{t("videoWorkbench.sourceVideo")}</span>
+                                        <Button
+                                            size="small"
+                                            icon={<Upload className="size-3.5" />}
+                                            onClick={() => {
+                                                uploadTargetRef.current = "video";
+                                                fileInputRef.current?.click();
+                                            }}
+                                        >
+                                            {t("workbench.upload")}
+                                        </Button>
+                                    </div>
+                                    <div className="mb-2 text-xs text-stone-500 dark:text-stone-400">{t("videoWorkbench.sourceVideoHint")}</div>
+                                    {sourceVideo ? (
+                                        <div className="flex items-center justify-between gap-3 rounded-lg border border-stone-200 p-3 dark:border-stone-800">
+                                            <div className="min-w-0">
+                                                <div className="truncate text-sm font-medium">{sourceVideo.name || t("videoWorkbench.sourceVideo")}</div>
+                                                <div className="text-xs text-stone-500">{sourceVideo.type || "video/mp4"}{sourceVideo.durationMs ? ` · ${(sourceVideo.durationMs / 1000).toFixed(1)}s` : ""}</div>
+                                            </div>
+                                            <Button size="small" danger icon={<Trash2 className="size-3.5" />} onClick={() => setSourceVideo(null)}>
+                                                {t("common.delete")}
+                                            </Button>
+                                        </div>
+                                    ) : (
+                                        <div className="flex min-h-20 items-center justify-center rounded-lg border border-dashed border-stone-300 text-sm text-stone-500 dark:border-stone-700">{t("videoWorkbench.noSourceVideo")}</div>
+                                    )}
+                                    {grokWorkflow === "extend" ? (
+                                        <div className="mt-3">
+                                            <div className="mb-1.5 text-sm font-semibold">{t("videoWorkbench.extendDuration")}</div>
+                                            <div className="flex flex-wrap gap-2">
+                                                {GROK2API_VIDEO_EXTEND_DURATION_OPTIONS.map((value) => (
+                                                    <Button
+                                                        key={value}
+                                                        size="small"
+                                                        type={Math.floor(Number(effectiveConfig.videoSeconds) || 6) === value ? "primary" : "default"}
+                                                        onClick={() => updateConfig("videoSeconds", String(value))}
+                                                    >
+                                                        {value}s
+                                                    </Button>
+                                                ))}
+                                            </div>
+                                            <div className="mt-1 text-xs text-stone-500">{t("videoWorkbench.extendDurationHint")}</div>
+                                        </div>
+                                    ) : null}
+                                </div>
+                            ) : null}
+
                             <div>
                                 <div className="mb-2 flex items-center justify-between gap-3">
                                     <span className="text-base font-semibold">{t("workbench.prompt")}</span>
@@ -443,18 +627,73 @@ export default function VideoPage() {
                                 <Input.TextArea value={prompt} onChange={(event) => setPrompt(event.target.value)} rows={7} placeholder={t("videoWorkbench.promptPlaceholder")} />
                             </div>
 
+                            {grok2apiMode && grokWorkflow === "generate" ? (
+                                <div className="min-w-0">
+                                    <div className="mb-2 flex items-center justify-between gap-3">
+                                        <span className="text-base font-semibold">{t("videoWorkbench.firstFrame")}</span>
+                                        <div className="flex gap-2">
+                                            <Button size="small" icon={<ClipboardPaste className="size-3.5" />} onClick={() => void addReferencesFromClipboard("firstFrame")}>
+                                                {t("workbench.clipboard")}
+                                            </Button>
+                                            <Button
+                                                size="small"
+                                                icon={<Upload className="size-3.5" />}
+                                                onClick={() => {
+                                                    uploadTargetRef.current = "firstFrame";
+                                                    fileInputRef.current?.click();
+                                                }}
+                                            >
+                                                {t("workbench.upload")}
+                                            </Button>
+                                        </div>
+                                    </div>
+                                    <div className="mb-2 text-xs text-stone-500 dark:text-stone-400">{t("videoWorkbench.firstFrameHint")}</div>
+                                    <div
+                                        className={`hover-scrollbar hover-scrollbar-hint flex min-h-24 w-full min-w-0 max-w-full gap-2 overflow-x-scroll overflow-y-hidden rounded-lg border border-dashed p-2 pb-3 overscroll-x-contain transition-colors ${referenceDragTarget === "firstFrame" ? "border-stone-900 bg-stone-100/80 dark:border-stone-100 dark:bg-stone-900/80" : "border-stone-300 dark:border-stone-700"}`}
+                                        onDragEnter={(event) => handleReferenceDragEnter(event, "firstFrame")}
+                                        onDragOver={(event) => {
+                                            event.preventDefault();
+                                            event.dataTransfer.dropEffect = "copy";
+                                        }}
+                                        onDragLeave={handleReferenceDragLeave}
+                                        onDrop={(event) => handleReferenceDrop(event, "firstFrame")}
+                                    >
+                                        {firstFrame ? (
+                                            <div className="group relative size-20 shrink-0 overflow-hidden rounded-md border border-stone-200 dark:border-stone-800">
+                                                <img src={firstFrame.dataUrl} alt={firstFrame.name} className="size-full object-cover" />
+                                                <span className="absolute left-1 top-1 rounded bg-black/60 px-1.5 py-0.5 text-[10px] font-medium text-white">{t("videoWorkbench.labels.firstFrame")}</span>
+                                                <button type="button" className="absolute right-1 top-1 hidden size-6 items-center justify-center rounded bg-black/60 text-white group-hover:flex" onClick={() => setFirstFrame(null)} aria-label={t("videoWorkbench.removeFirstFrame")}>
+                                                    <Trash2 className="size-3.5" />
+                                                </button>
+                                            </div>
+                                        ) : (
+                                            <div className="flex min-w-full items-center justify-center text-sm text-stone-500">{referenceDragTarget === "firstFrame" ? t("videoWorkbench.dropReferences") : t("videoWorkbench.noFirstFrame")}</div>
+                                        )}
+                                    </div>
+                                </div>
+                            ) : null}
+
+                            {(!grok2apiMode || grokWorkflow === "generate") ? (
                             <div className="min-w-0">
                                 <div className="mb-2 flex items-center justify-between gap-3">
-                                    <span className="text-base font-semibold">{t("videoWorkbench.references")}</span>
+                                    <span className="text-base font-semibold">{grok2apiMode ? t("videoWorkbench.extraReferences") : t("videoWorkbench.references")}</span>
                                     <div className="flex gap-2">
                                         <Button size="small" icon={<ClipboardPaste className="size-3.5" />} onClick={() => void addReferencesFromClipboard()}>
                                             {t("workbench.clipboard")}
                                         </Button>
-                                        <Button size="small" icon={<Upload className="size-3.5" />} onClick={() => fileInputRef.current?.click()}>
+                                        <Button
+                                            size="small"
+                                            icon={<Upload className="size-3.5" />}
+                                            onClick={() => {
+                                                uploadTargetRef.current = "image";
+                                                fileInputRef.current?.click();
+                                            }}
+                                        >
                                             {t("workbench.upload")}
                                         </Button>
                                     </div>
                                 </div>
+                                {grok2apiMode ? <div className="mb-2 text-xs text-stone-500 dark:text-stone-400">{t("videoWorkbench.extraReferencesHint")}</div> : null}
                                 <div
                                     className={`hover-scrollbar hover-scrollbar-hint flex min-h-24 w-full min-w-0 max-w-full gap-2 overflow-x-scroll overflow-y-hidden rounded-lg border border-dashed p-2 pb-3 overscroll-x-contain transition-colors ${referenceDragTarget === "image" ? "border-stone-900 bg-stone-100/80 dark:border-stone-100 dark:bg-stone-900/80" : "border-stone-300 dark:border-stone-700"}`}
                                     onDragEnter={(event) => handleReferenceDragEnter(event, "image")}
@@ -463,91 +702,110 @@ export default function VideoPage() {
                                         event.dataTransfer.dropEffect = "copy";
                                     }}
                                     onDragLeave={handleReferenceDragLeave}
-                                    onDrop={handleReferenceDrop}
+                                    onDrop={(event) => handleReferenceDrop(event, "image")}
                                 >
                                     {references.map((item, index) => (
                                         <div key={item.id} className="group relative size-20 shrink-0 overflow-hidden rounded-md border border-stone-200 dark:border-stone-800">
                                             <img src={item.dataUrl} alt={item.name} className="size-full object-cover" />
-                                            <span className="absolute left-1 top-1 rounded bg-black/60 px-1.5 py-0.5 text-[10px] font-medium text-white">{seedanceReferenceLabel("image", index)}</span>
+                                            <span className="absolute left-1 top-1 rounded bg-black/60 px-1.5 py-0.5 text-[10px] font-medium text-white">{grok2apiMode ? t("videoWorkbench.labels.reference", { index: index + 1 }) : seedanceReferenceLabel("image", index)}</span>
                                             <ReferenceOrderButtons index={index} total={references.length} onMove={(offset) => setReferences((value) => moveListItem(value, index, offset))} />
                                             <button type="button" className="absolute right-1 top-1 hidden size-6 items-center justify-center rounded bg-black/60 text-white group-hover:flex" onClick={() => setReferences((value) => value.filter((ref) => ref.id !== item.id))} aria-label={t("videoWorkbench.removeImage")}>
                                                 <Trash2 className="size-3.5" />
                                             </button>
                                         </div>
                                     ))}
-                                    {!references.length ? <div className="flex min-w-full items-center justify-center text-sm text-stone-500">{referenceDragTarget === "image" ? t("videoWorkbench.dropReferences") : t("videoWorkbench.noImages")}</div> : null}
+                                    {!references.length ? <div className="flex min-w-full items-center justify-center text-sm text-stone-500">{referenceDragTarget === "image" ? t("videoWorkbench.dropReferences") : grok2apiMode ? t("videoWorkbench.noGrokImages") : t("videoWorkbench.noImages")}</div> : null}
                                 </div>
                             </div>
+                            ) : null}
 
-                            <div className="min-w-0">
-                                <div className="mb-2 flex items-center justify-between gap-3">
-                                    <span className="text-base font-semibold">{t("videoWorkbench.videoReferences")}</span>
-                                    <Button size="small" icon={<Upload className="size-3.5" />} onClick={() => fileInputRef.current?.click()}>
-                                        {t("workbench.upload")}
-                                    </Button>
-                                </div>
-                                <div
-                                    className={`hover-scrollbar hover-scrollbar-hint flex min-h-24 w-full min-w-0 max-w-full gap-2 overflow-x-scroll overflow-y-hidden rounded-lg border border-dashed p-2 pb-3 overscroll-x-contain transition-colors ${referenceDragTarget === "video" ? "border-stone-900 bg-stone-100/80 dark:border-stone-100 dark:bg-stone-900/80" : "border-stone-300 dark:border-stone-700"}`}
-                                    onDragEnter={(event) => handleReferenceDragEnter(event, "video")}
-                                    onDragOver={(event) => {
-                                        event.preventDefault();
-                                        event.dataTransfer.dropEffect = "copy";
-                                    }}
-                                    onDragLeave={handleReferenceDragLeave}
-                                    onDrop={handleReferenceDrop}
-                                >
-                                    {videoReferences.map((item, index) => (
-                                        <div key={item.id} className="group relative h-20 w-32 shrink-0 overflow-hidden rounded-md border border-stone-200 bg-black dark:border-stone-800">
-                                            <video src={item.url} className="size-full object-cover" muted preload="metadata" />
-                                            <span className="absolute left-1 top-1 rounded bg-black/60 px-1.5 py-0.5 text-[10px] font-medium text-white">{seedanceReferenceLabel("video", index)}</span>
-                                            <ReferenceOrderButtons index={index} total={videoReferences.length} onMove={(offset) => setVideoReferences((value) => moveListItem(value, index, offset))} />
-                                            <button type="button" className="absolute right-1 top-1 hidden size-6 items-center justify-center rounded bg-black/60 text-white group-hover:flex" onClick={() => setVideoReferences((value) => value.filter((ref) => ref.id !== item.id))} aria-label={t("videoWorkbench.removeVideo")}>
-                                                <Trash2 className="size-3.5" />
-                                            </button>
+                            {seedanceMode ? (
+                                <>
+                                    <div className="min-w-0">
+                                        <div className="mb-2 flex items-center justify-between gap-3">
+                                            <span className="text-base font-semibold">{t("videoWorkbench.videoReferences")}</span>
+                                            <Button
+                                                size="small"
+                                                icon={<Upload className="size-3.5" />}
+                                                onClick={() => {
+                                                    uploadTargetRef.current = "video";
+                                                    fileInputRef.current?.click();
+                                                }}
+                                            >
+                                                {t("workbench.upload")}
+                                            </Button>
                                         </div>
-                                    ))}
-                                    {!videoReferences.length ? <div className="flex min-w-full items-center justify-center text-sm text-stone-500">{referenceDragTarget === "video" ? t("videoWorkbench.dropReferences") : t("videoWorkbench.noVideos")}</div> : null}
-                                </div>
-                            </div>
+                                        <div
+                                            className={`hover-scrollbar hover-scrollbar-hint flex min-h-24 w-full min-w-0 max-w-full gap-2 overflow-x-scroll overflow-y-hidden rounded-lg border border-dashed p-2 pb-3 overscroll-x-contain transition-colors ${referenceDragTarget === "video" ? "border-stone-900 bg-stone-100/80 dark:border-stone-100 dark:bg-stone-900/80" : "border-stone-300 dark:border-stone-700"}`}
+                                            onDragEnter={(event) => handleReferenceDragEnter(event, "video")}
+                                            onDragOver={(event) => {
+                                                event.preventDefault();
+                                                event.dataTransfer.dropEffect = "copy";
+                                            }}
+                                            onDragLeave={handleReferenceDragLeave}
+                                            onDrop={(event) => handleReferenceDrop(event, "video")}
+                                        >
+                                            {videoReferences.map((item, index) => (
+                                                <div key={item.id} className="group relative h-20 w-32 shrink-0 overflow-hidden rounded-md border border-stone-200 bg-black dark:border-stone-800">
+                                                    <video src={item.url} className="size-full object-cover" muted preload="metadata" />
+                                                    <span className="absolute left-1 top-1 rounded bg-black/60 px-1.5 py-0.5 text-[10px] font-medium text-white">{seedanceReferenceLabel("video", index)}</span>
+                                                    <ReferenceOrderButtons index={index} total={videoReferences.length} onMove={(offset) => setVideoReferences((value) => moveListItem(value, index, offset))} />
+                                                    <button type="button" className="absolute right-1 top-1 hidden size-6 items-center justify-center rounded bg-black/60 text-white group-hover:flex" onClick={() => setVideoReferences((value) => value.filter((ref) => ref.id !== item.id))} aria-label={t("videoWorkbench.removeVideo")}>
+                                                        <Trash2 className="size-3.5" />
+                                                    </button>
+                                                </div>
+                                            ))}
+                                            {!videoReferences.length ? <div className="flex min-w-full items-center justify-center text-sm text-stone-500">{referenceDragTarget === "video" ? t("videoWorkbench.dropReferences") : t("videoWorkbench.noVideos")}</div> : null}
+                                        </div>
+                                    </div>
 
-                            <div className="min-w-0">
-                                <div className="mb-2 flex items-center justify-between gap-3">
-                                    <span className="text-base font-semibold">{t("videoWorkbench.audioReferences")}</span>
-                                    <Button size="small" icon={<Upload className="size-3.5" />} onClick={() => fileInputRef.current?.click()}>
-                                        {t("workbench.upload")}
-                                    </Button>
-                                </div>
-                                <div
-                                    className={`hover-scrollbar hover-scrollbar-hint flex min-h-24 w-full min-w-0 max-w-full gap-2 overflow-x-scroll overflow-y-hidden rounded-lg border border-dashed p-2 pb-3 overscroll-x-contain transition-colors ${referenceDragTarget === "audio" ? "border-stone-900 bg-stone-100/80 dark:border-stone-100 dark:bg-stone-900/80" : "border-stone-300 dark:border-stone-700"}`}
-                                    onDragEnter={(event) => handleReferenceDragEnter(event, "audio")}
-                                    onDragOver={(event) => {
-                                        event.preventDefault();
-                                        event.dataTransfer.dropEffect = "copy";
-                                    }}
-                                    onDragLeave={handleReferenceDragLeave}
-                                    onDrop={handleReferenceDrop}
-                                >
-                                    {audioReferences.map((item, index) => (
-                                        <div key={item.id} className="group relative flex h-20 w-48 shrink-0 flex-col justify-center gap-2 rounded-md border border-stone-200 bg-stone-50 px-2 dark:border-stone-800 dark:bg-stone-900">
-                                            <div className="flex min-w-0 items-center gap-2 text-xs text-stone-500 dark:text-stone-400">
-                                                <Music2 className="size-4 shrink-0" />
-                                                <span className="shrink-0 rounded bg-stone-200 px-1 text-[10px] text-stone-700 dark:bg-stone-800 dark:text-stone-200">{seedanceReferenceLabel("audio", index)}</span>
-                                                <span className="truncate">{item.name}</span>
-                                            </div>
-                                            <audio src={item.url} controls className="h-8 w-full" preload="metadata" />
-                                            <ReferenceOrderButtons index={index} total={audioReferences.length} onMove={(offset) => setAudioReferences((value) => moveListItem(value, index, offset))} />
-                                            <button type="button" className="absolute right-1 top-1 hidden size-6 items-center justify-center rounded bg-black/60 text-white group-hover:flex" onClick={() => setAudioReferences((value) => value.filter((ref) => ref.id !== item.id))} aria-label={t("videoWorkbench.removeAudio")}>
-                                                <Trash2 className="size-3.5" />
-                                            </button>
+                                    <div className="min-w-0">
+                                        <div className="mb-2 flex items-center justify-between gap-3">
+                                            <span className="text-base font-semibold">{t("videoWorkbench.audioReferences")}</span>
+                                            <Button
+                                                size="small"
+                                                icon={<Upload className="size-3.5" />}
+                                                onClick={() => {
+                                                    uploadTargetRef.current = "audio";
+                                                    fileInputRef.current?.click();
+                                                }}
+                                            >
+                                                {t("workbench.upload")}
+                                            </Button>
                                         </div>
-                                    ))}
-                                    {!audioReferences.length ? <div className="flex min-w-full items-center justify-center text-center text-sm text-stone-500">{referenceDragTarget === "audio" ? t("videoWorkbench.dropReferences") : t("videoWorkbench.noAudio")}</div> : null}
-                                </div>
-                            </div>
+                                        <div
+                                            className={`hover-scrollbar hover-scrollbar-hint flex min-h-24 w-full min-w-0 max-w-full gap-2 overflow-x-scroll overflow-y-hidden rounded-lg border border-dashed p-2 pb-3 overscroll-x-contain transition-colors ${referenceDragTarget === "audio" ? "border-stone-900 bg-stone-100/80 dark:border-stone-100 dark:bg-stone-900/80" : "border-stone-300 dark:border-stone-700"}`}
+                                            onDragEnter={(event) => handleReferenceDragEnter(event, "audio")}
+                                            onDragOver={(event) => {
+                                                event.preventDefault();
+                                                event.dataTransfer.dropEffect = "copy";
+                                            }}
+                                            onDragLeave={handleReferenceDragLeave}
+                                            onDrop={(event) => handleReferenceDrop(event, "audio")}
+                                        >
+                                            {audioReferences.map((item, index) => (
+                                                <div key={item.id} className="group relative flex h-20 w-48 shrink-0 flex-col justify-center gap-2 rounded-md border border-stone-200 bg-stone-50 px-2 dark:border-stone-800 dark:bg-stone-900">
+                                                    <div className="flex min-w-0 items-center gap-2 text-xs text-stone-500 dark:text-stone-400">
+                                                        <Music2 className="size-4 shrink-0" />
+                                                        <span className="shrink-0 rounded bg-stone-200 px-1 text-[10px] text-stone-700 dark:bg-stone-800 dark:text-stone-200">{seedanceReferenceLabel("audio", index)}</span>
+                                                        <span className="truncate">{item.name}</span>
+                                                    </div>
+                                                    <audio src={item.url} controls className="h-8 w-full" preload="metadata" />
+                                                    <ReferenceOrderButtons index={index} total={audioReferences.length} onMove={(offset) => setAudioReferences((value) => moveListItem(value, index, offset))} />
+                                                    <button type="button" className="absolute right-1 top-1 hidden size-6 items-center justify-center rounded bg-black/60 text-white group-hover:flex" onClick={() => setAudioReferences((value) => value.filter((ref) => ref.id !== item.id))} aria-label={t("videoWorkbench.removeAudio")}>
+                                                        <Trash2 className="size-3.5" />
+                                                    </button>
+                                                </div>
+                                            ))}
+                                            {!audioReferences.length ? <div className="flex min-w-full items-center justify-center text-center text-sm text-stone-500">{referenceDragTarget === "audio" ? t("videoWorkbench.dropReferences") : t("videoWorkbench.noAudio")}</div> : null}
+                                        </div>
+                                    </div>
+                                </>
+                            ) : null}
 
                             <div className="flex items-center justify-between rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-sm dark:border-stone-800 dark:bg-stone-900 sm:hidden">
                                 <span className="truncate text-stone-500 dark:text-stone-400">
-                                    {modelOptionLabel(effectiveConfig, model)} · {normalizeResolution(effectiveConfig.vquality)}p · {videoSizeLabel(effectiveConfig.size)} · {normalizeVideoSeconds(effectiveConfig.videoSeconds)}s
+                                    {modelOptionLabel(effectiveConfig, model)} · {videoResolutionDisplay(effectiveConfig.vquality)} · {videoSizeLabel(effectiveConfig.size)} · {normalizeVideoSeconds(effectiveConfig.videoSeconds)}s
                                 </span>
                                 <Button size="small" type="text" icon={<SlidersHorizontal className="size-4" />} onClick={() => setSettingsOpen(true)}>
                                     {t("workbench.adjust")}
@@ -573,7 +831,7 @@ export default function VideoPage() {
                         </div>
                         {results.length ? (
                             <div className="grid gap-4">
-                                {results.map((result) => (result.status === "success" && result.video ? <ResultVideoCard key={result.id} video={result.video} onDownload={downloadVideo} onSaveAsset={saveResultToAssets} /> : result.status === "failed" ? <FailedVideoCard key={result.id} error={result.error || t("workbench.generationFailed")} onRetry={retryResult} /> : <PendingVideoCard key={result.id} />))}
+                                {results.map((result) => (result.status === "success" && result.video ? <ResultVideoCard key={result.id} video={result.video} onDownload={downloadVideo} onSaveAsset={saveResultToAssets} /> : result.status === "failed" ? <FailedVideoCard key={result.id} error={result.error || t("workbench.generationFailed")} onRetry={retryResult} /> : <PendingVideoCard key={result.id} progress={result.progress} statusMessage={result.statusMessage} />))}
                             </div>
                         ) : (
                             <div className="flex min-h-[320px] flex-col items-center justify-center rounded-lg border border-dashed border-stone-300 text-center dark:border-stone-700 lg:min-h-[560px]">
@@ -591,7 +849,8 @@ export default function VideoPage() {
                 multiple
                 className="hidden"
                 onChange={(event) => {
-                    void addReferences(event.target.files);
+                    void addReferences(event.target.files, uploadTargetRef.current);
+                    uploadTargetRef.current = "image";
                     event.target.value = "";
                 }}
             />
@@ -655,13 +914,27 @@ function ResultVideoCard({ video, onDownload, onSaveAsset }: { video: GeneratedV
     );
 }
 
-function PendingVideoCard() {
+function PendingVideoCard({ progress, statusMessage }: { progress?: number; statusMessage?: string }) {
     const { t } = useTranslation();
+    const pct = typeof progress === "number" && Number.isFinite(progress) ? Math.max(0, Math.min(100, progress)) : undefined;
     return (
         <div className="relative aspect-video overflow-hidden rounded-lg border border-dashed border-stone-300 bg-stone-50 dark:border-stone-700 dark:bg-stone-900">
-            <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-sm text-stone-500 dark:text-stone-400">
+            <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 px-4 text-sm text-stone-500 dark:text-stone-400">
                 <LoaderCircle className="size-6 animate-spin" />
-                <span>{t("workbench.generating")}</span>
+                <span className="font-medium text-stone-700 dark:text-stone-200">{t("workbench.generating")}</span>
+                {pct !== undefined ? (
+                    <span className="text-base font-semibold tabular-nums text-stone-900 dark:text-stone-100">{pct}%</span>
+                ) : null}
+                {statusMessage ? (
+                    <span className="text-xs opacity-70">{t("videoWorkbench.jobStatus", { status: statusMessage })}</span>
+                ) : (
+                    <span className="text-xs opacity-70">{t("videoWorkbench.pollingHint")}</span>
+                )}
+                {pct !== undefined ? (
+                    <div className="mt-1 h-1.5 w-2/3 max-w-xs overflow-hidden rounded-full bg-stone-200 dark:bg-stone-800">
+                        <div className="h-full rounded-full bg-stone-800 transition-all dark:bg-stone-200" style={{ width: `${pct}%` }} />
+                    </div>
+                ) : null}
             </div>
         </div>
     );
@@ -794,6 +1067,9 @@ async function normalizeLog(log: Partial<GenerationLog>): Promise<GenerationLog>
             dataUrl: await resolveImageUrl(item.storageKey, item.dataUrl),
         })),
     );
+    const firstFrame = log.firstFrame
+        ? { ...log.firstFrame, dataUrl: await resolveImageUrl(log.firstFrame.storageKey, log.firstFrame.dataUrl) }
+        : null;
     const config = normalizeLogConfig(log);
     return {
         id: log.id || nanoid(),
@@ -803,6 +1079,7 @@ async function normalizeLog(log: Partial<GenerationLog>): Promise<GenerationLog>
         time: log.time || new Date().toLocaleString(i18n.resolvedLanguage, { hour12: false }),
         model: log.model || config.videoModel || "",
         config,
+        firstFrame,
         references,
         videoReferences,
         audioReferences,
@@ -820,6 +1097,7 @@ async function normalizeLog(log: Partial<GenerationLog>): Promise<GenerationLog>
 function serializeLog(log: GenerationLog): GenerationLog {
     return {
         ...log,
+        firstFrame: log.firstFrame ? { ...log.firstFrame, dataUrl: log.firstFrame.storageKey ? "" : log.firstFrame.dataUrl } : null,
         references: log.references.map((item) => ({ ...item, dataUrl: item.storageKey ? "" : item.dataUrl })),
         videoReferences: log.videoReferences.map((item) => (item.storageKey ? { ...item, url: "" } : item)),
         audioReferences: log.audioReferences.map((item) => (item.storageKey ? { ...item, url: "" } : item)),
@@ -874,19 +1152,19 @@ function normalizeLogConfig(log: Partial<GenerationLog>): GenerationLogConfig {
         model: log.config?.model || log.model || "",
         videoModel: log.config?.videoModel || log.model || "",
         size: log.config?.size || log.size || "",
-        vquality: normalizeResolution(log.config?.vquality || log.resolution || ""),
+        vquality: preserveVideoResolution(log.config?.vquality || log.resolution || ""),
         videoSeconds: log.config?.videoSeconds || log.seconds || "",
         videoGenerateAudio: log.config?.videoGenerateAudio || "true",
         videoWatermark: log.config?.videoWatermark || "false",
     };
 }
 
-function buildLog({ prompt, model, config, references, videoReferences, audioReferences, durationMs, status, task, video, error }: { prompt: string; model: string; config: AiConfig; references: ReferenceImage[]; videoReferences: ReferenceVideo[]; audioReferences: ReferenceAudio[]; durationMs: number; status: GenerationLog["status"]; task?: VideoGenerationTask; video?: GeneratedVideo; error?: string }): GenerationLog {
+function buildLog({ prompt, model, config, firstFrame = null, references, videoReferences, audioReferences, durationMs, status, task, video, error }: { prompt: string; model: string; config: AiConfig; firstFrame?: ReferenceImage | null; references: ReferenceImage[]; videoReferences: ReferenceVideo[]; audioReferences: ReferenceAudio[]; durationMs: number; status: GenerationLog["status"]; task?: VideoGenerationTask; video?: GeneratedVideo; error?: string }): GenerationLog {
     const logConfig = {
         model: config.model,
         videoModel: config.videoModel,
         size: config.size,
-        vquality: normalizeResolution(config.vquality),
+        vquality: preserveVideoResolution(config.vquality),
         videoSeconds: config.videoSeconds,
         videoGenerateAudio: config.videoGenerateAudio,
         videoWatermark: config.videoWatermark,
@@ -899,6 +1177,7 @@ function buildLog({ prompt, model, config, references, videoReferences, audioRef
         time: new Date().toLocaleString(i18n.resolvedLanguage, { hour12: false }),
         model,
         config: logConfig,
+        firstFrame: firstFrame || null,
         references,
         videoReferences,
         audioReferences,
@@ -915,16 +1194,25 @@ function buildLog({ prompt, model, config, references, videoReferences, audioRef
 
 function buildVideoConfig(config: AiConfig, model: string): AiConfig {
     const seedance = isSeedanceVideoConfig({ ...config, model });
+    const grok2api = isGrok2apiVideoConfig({ ...config, model });
+    const rawSize = (config.size || "").trim();
+    const keepAuto = grok2api && (!rawSize || rawSize === "auto" || rawSize === "adaptive");
     return {
         ...config,
         model,
         videoModel: model,
-        size: seedance ? normalizeSeedanceRatio(config.size) : normalizeVideoSize(config.size),
-        videoSeconds: normalizeVideoSeconds(config.videoSeconds),
-        vquality: normalizeResolution(config.vquality),
+        size: seedance ? normalizeSeedanceRatio(config.size) : keepAuto ? "auto" : grok2api ? normalizeGrok2apiVideoRatio(config.size) : normalizeVideoSize(config.size),
+        videoSeconds: seedance ? normalizeVideoSeconds(config.videoSeconds) : grok2api ? String(normalizeGrok2apiVideoDuration(config.videoSeconds)) : normalizeVideoSeconds(config.videoSeconds),
+        vquality: seedance ? normalizeResolution(config.vquality) : grok2api ? normalizeGrok2apiVideoResolution(config.vquality) : normalizeResolution(config.vquality),
         videoGenerateAudio: String(boolConfig(config.videoGenerateAudio, true)),
         videoWatermark: String(boolConfig(config.videoWatermark, false)),
     };
+}
+
+function referenceImageLimit(config: AiConfig, model: string) {
+    // Grok reference_images only (mutually exclusive with first-frame image at request time).
+    if (isGrok2apiVideoConfig({ ...config, model })) return GROK2API_VIDEO_REFERENCE_IMAGE_LIMIT;
+    return SEEDANCE_REFERENCE_LIMITS.images;
 }
 
 function normalizeVideoSeconds(value: string) {
@@ -939,6 +1227,21 @@ function normalizeVideoSize(value: string) {
 
 function normalizeResolution(value: string) {
     return normalizeVideoResolutionValue(value);
+}
+
+/** Keep Grok/Seedance style values such as 720p instead of stripping the suffix. */
+function preserveVideoResolution(value: string) {
+    const raw = String(value || "").trim();
+    if (/^\d+p$/i.test(raw)) return raw.toLowerCase();
+    if (raw === "low") return "480p";
+    if (raw === "high" || raw === "hd") return "1080p";
+    if (raw === "medium" || raw === "auto") return "720p";
+    if (/^\d+$/.test(raw)) return `${raw}p`;
+    return normalizeResolution(raw);
+}
+
+function videoResolutionDisplay(value: string) {
+    return preserveVideoResolution(value);
 }
 
 function delay(ms: number) {
