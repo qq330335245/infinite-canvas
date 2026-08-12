@@ -3,7 +3,7 @@ import { nanoid } from "nanoid";
 
 import i18n from "@/i18n";
 import { dataUrlToFile, readImageMeta } from "@/lib/image-utils";
-import { GROK2API_VIDEO_REFERENCE_IMAGE_LIMIT, grok2apiVideoAspectRatio, grok2apiVideoAspectRatioFromDimensions, grok2apiVideoDuration, grok2apiVideoExtendDuration, grok2apiVideoResolution, isGrok2apiAutoVideoSize, type Grok2apiVideoGenerateMode, type Grok2apiVideoWorkflow } from "@/lib/grok2api";
+import { GROK2API_VIDEO_REFERENCE_IMAGE_LIMIT, grok2apiVideoAspectRatio, grok2apiVideoAspectRatioFromDimensions, grok2apiVideoDuration, grok2apiVideoExtendDuration, grok2apiVideoResolution, isGrok2apiAutoVideoSize, isGrokImagineVideoModel, type Grok2apiVideoGenerateMode, type Grok2apiVideoWorkflow } from "@/lib/grok2api";
 import { getMediaBlob, uploadMediaFile, type UploadedFile } from "@/services/file-storage";
 import { imageToDataUrl } from "@/services/image-storage";
 import { boolConfig, buildSeedancePromptText, isSeedanceVideoConfig, normalizeSeedanceDuration, normalizeSeedanceRatio, normalizeSeedanceResolution, seedanceVideoReferenceError, SEEDANCE_REFERENCE_LIMITS } from "@/lib/seedance-video";
