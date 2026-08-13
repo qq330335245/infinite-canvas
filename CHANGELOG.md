@@ -3,6 +3,7 @@
 ## Unreleased
 
 + [新增] 提示词来源新增 Freestylefly GPT Image 2 内置来源。
++ [新增] Grok Imagine Image 2.0：画布生图同步官方 `quality=low|medium`、`resolution=1k|2k` 与新宽高比；改图 2.0 最多 5 张参考。
 
 ## v0.15.1 - 2026-08-07
 

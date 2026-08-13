@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 
 import i18n from "@/i18n";
 import { type CanvasTheme } from "@/lib/canvas-theme";
+import { GROK2API_IMAGE_ASPECT_RATIOS, GROK2API_IMAGE_QUALITIES, GROK2API_IMAGE_RESOLUTIONS, grok2apiImageQuality, grok2apiImageResolution, isGrok2apiImage20, isGrok2apiImageConfig } from "@/lib/grok2api";
 import type { AiConfig } from "@/stores/use-config-store";
 
 const qualityOptions = [
@@ -35,7 +36,7 @@ export const imageAspectOptions = aspectOptions.map((item) => ({ value: item.siz
 
 type ImageSettingsPanelProps = {
     config: AiConfig;
-    onConfigChange: (key: "quality" | "size" | "count" | "background", value: string) => void;
+    onConfigChange: (key: "quality" | "imageResolution" | "size" | "count" | "background", value: string) => void;
     theme: CanvasTheme;
     showTitle?: boolean;
     className?: string;
@@ -46,6 +47,9 @@ type ImageSettingsPanelProps = {
 export function ImageSettingsPanel({ config, onConfigChange, theme, showTitle = true, className = "w-[320px] space-y-4 rounded-2xl px-1 py-0.5", maxCount = 15, quickCount = 10 }: ImageSettingsPanelProps) {
     const { t } = useTranslation();
     const [snapDimensionToStep, setSnapDimensionToStep] = useState(true);
+    if (isGrok2apiImageConfig(config)) {
+        return <Grok2apiImageSettingsPanel config={config} onConfigChange={onConfigChange} theme={theme} showTitle={showTitle} className={className} maxCount={Math.min(10, maxCount)} quickCount={Math.min(10, quickCount)} />;
+    }
     const quality = config.quality || "auto";
     const count = Math.max(1, Math.min(maxCount, Math.floor(Math.abs(Number(config.count)) || 1)));
     const activeSize = config.size || "auto";
@@ -148,6 +152,102 @@ export function ImageSettingsPanel({ config, onConfigChange, theme, showTitle = 
     );
 }
 
+const grokAspectOptions = [
+    { value: "1:1", width: 1024, height: 1024 },
+    { value: "16:9", width: 1824, height: 1024 },
+    { value: "9:16", width: 1024, height: 1824 },
+    { value: "4:3", width: 1360, height: 1024 },
+    { value: "3:4", width: 1024, height: 1360 },
+    { value: "3:2", width: 1536, height: 1024 },
+    { value: "2:3", width: 1024, height: 1536 },
+    { value: "2:1", width: 2048, height: 1024 },
+    { value: "1:2", width: 1024, height: 2048 },
+    { value: "19.5:9", width: 1950, height: 900 },
+    { value: "9:19.5", width: 900, height: 1950 },
+    { value: "20:9", width: 2048, height: 922 },
+    { value: "9:20", width: 922, height: 2048 },
+    { value: "auto", width: 0, height: 0 },
+] as const;
+
+function Grok2apiImageSettingsPanel({ config, onConfigChange, theme, showTitle, className, maxCount = 10, quickCount = 10 }: ImageSettingsPanelProps) {
+    const { t } = useTranslation();
+    const model = config.imageModel || config.model;
+    const showQuality = isGrok2apiImage20(model);
+    const resolution = grok2apiImageResolution(config.quality, { model, imageResolution: config.imageResolution });
+    const quality = grok2apiImageQuality(config.quality);
+    const size = (config.size || "1:1").trim() || "1:1";
+    const selectedRatio = GROK2API_IMAGE_ASPECT_RATIOS.includes(size as (typeof GROK2API_IMAGE_ASPECT_RATIOS)[number]) ? size : grok2apiImageAspectRatio(size);
+    const count = Math.max(1, Math.min(maxCount, Math.floor(Math.abs(Number(config.count)) || 1)));
+
+    return (
+        <ImageSettingsTheme theme={theme}>
+            <div className={className} style={{ color: theme.node.text }} onMouseDown={(event) => event.stopPropagation()}>
+                {showTitle ? <div className="text-lg font-semibold">{t("settingsPanels.image.title")}</div> : null}
+                <div className="space-y-2.5">
+                    <SettingTitle color={theme.node.muted}>{t("settingsPanels.image.resolution")}</SettingTitle>
+                    <div className="grid grid-cols-2 gap-2.5">
+                        {GROK2API_IMAGE_RESOLUTIONS.map((value) => (
+                            <OptionPill key={value} selected={resolution === value} theme={theme} onClick={() => onConfigChange("imageResolution", value)}>
+                                {value}
+                            </OptionPill>
+                        ))}
+                    </div>
+                    <p className="text-[11px] leading-snug opacity-60" style={{ color: theme.node.muted }}>
+                        {t("settingsPanels.image.grokResolutionHint")}
+                    </p>
+                </div>
+                {showQuality ? (
+                    <div className="space-y-2.5">
+                        <SettingTitle color={theme.node.muted}>{t("settingsPanels.image.quality")}</SettingTitle>
+                        <div className="grid grid-cols-2 gap-2.5">
+                            {GROK2API_IMAGE_QUALITIES.map((value) => (
+                                <OptionPill key={value} selected={quality === value} theme={theme} onClick={() => onConfigChange("quality", value)}>
+                                    {t(`settingsPanels.common.${value}`)}
+                                </OptionPill>
+                            ))}
+                        </div>
+                        <p className="text-[11px] leading-snug opacity-60" style={{ color: theme.node.muted }}>
+                            {t("settingsPanels.image.grokQualityHint")}
+                        </p>
+                    </div>
+                ) : null}
+                <div className="space-y-2.5">
+                    <SettingTitle color={theme.node.muted}>{t("settingsPanels.image.aspectRatio")}</SettingTitle>
+                    <div className="grid grid-cols-4 gap-2.5">
+                        {grokAspectOptions.map((item) => (
+                            <button
+                                key={item.value}
+                                type="button"
+                                className="flex h-[72px] cursor-pointer flex-col items-center justify-center gap-1.5 rounded-xl border bg-transparent text-sm transition hover:opacity-80"
+                                style={{ borderColor: selectedRatio === item.value ? theme.node.text : theme.node.stroke, background: "transparent", color: theme.node.text }}
+                                onMouseDown={(event) => event.stopPropagation()}
+                                onClick={() => onConfigChange("size", item.value)}
+                            >
+                                <AspectIcon type={item.value === "auto" ? "auto" : "ratio"} width={item.width} height={item.height} color={theme.node.text} />
+                                <span>{item.value}</span>
+                            </button>
+                        ))}
+                    </div>
+                    <p className="text-[11px] leading-snug opacity-60" style={{ color: theme.node.muted }}>
+                        {t("settingsPanels.image.grokRatioHint")}
+                    </p>
+                </div>
+                <div className="space-y-2.5">
+                    <SettingTitle color={theme.node.muted}>{t("settingsPanels.image.count")}</SettingTitle>
+                    <div className="grid grid-cols-4 gap-2.5">
+                        {Array.from({ length: quickCount }, (_, index) => index + 1).map((value) => (
+                            <OptionPill key={value} selected={count === value} theme={theme} onClick={() => onConfigChange("count", String(value))}>
+                                {t("settingsPanels.image.images", { count: value })}
+                            </OptionPill>
+                        ))}
+                        <CountInput value={count} max={maxCount} theme={theme} onChange={(value) => onConfigChange("count", String(value || 1))} />
+                    </div>
+                </div>
+            </div>
+        </ImageSettingsTheme>
+    );
+}
+
 export function ImageSettingsTheme({ theme, children }: { theme: CanvasTheme; children: ReactNode }) {
     return (
         <ConfigProvider
@@ -162,6 +262,7 @@ export function ImageSettingsTheme({ theme, children }: { theme: CanvasTheme; ch
 }
 
 export function imageQualityLabel(value: string) {
+    if (["1k", "2k"].includes(value)) return value;
     return (["auto", "high", "medium", "low"].includes(value) ? i18n.t(`settingsPanels.common.${value}`) : value);
 }
 

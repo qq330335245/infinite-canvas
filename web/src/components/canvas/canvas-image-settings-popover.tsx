@@ -6,6 +6,7 @@ import { useTranslation } from "react-i18next";
 
 import { ImageSettingsPanel, imageQualityLabel, imageSizeLabel } from "@/components/image-settings-panel";
 import { canvasThemes } from "@/lib/canvas-theme";
+import { grok2apiImageQuality, grok2apiImageResolution, isGrok2apiImage20, isGrok2apiImageConfig } from "@/lib/grok2api";
 import { useThemeStore } from "@/stores/use-theme-store";
 import type { AiConfig } from "@/stores/use-config-store";
 
@@ -65,7 +66,9 @@ export function CanvasImageSettingsPopover({ config, onConfigChange, onOpenChang
             <span ref={buttonRef} className="inline-flex min-w-0">
                 <Button size="small" type="text" className={buttonClassName || "!h-8 !max-w-[180px] !justify-start !rounded-full !px-2.5"} style={{ background: theme.node.fill, color: theme.node.text }} icon={<Settings2 className="size-3.5" />} onClick={() => updateOpen(!open)}>
                     <span className="truncate">
-                        {imageQualityLabel(quality)} · {imageSizeLabel(activeSize)} · {t("canvas.controls.images", { count })}
+                        {isGrok2apiImageConfig(config)
+                            ? `${grok2apiImageResolution(quality, { model: config.imageModel || config.model, imageResolution: config.imageResolution })}${isGrok2apiImage20(config.imageModel || config.model) ? ` · ${imageQualityLabel(grok2apiImageQuality(quality))}` : ""} · ${imageSizeLabel(activeSize)} · ${t("canvas.controls.images", { count })}`
+                            : `${imageQualityLabel(quality)} · ${imageSizeLabel(activeSize)} · ${t("canvas.controls.images", { count })}`}
                     </span>
                 </Button>
             </span>

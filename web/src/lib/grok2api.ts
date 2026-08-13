@@ -2,7 +2,11 @@
 
 import { resolveModelRequestConfig, type AiConfig } from "@/stores/use-config-store";
 
-const IMAGE_ASPECT_RATIOS = ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "2:1", "1:2"] as const;
+export const GROK2API_IMAGE_ASPECT_RATIOS = ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "2:1", "1:2", "19.5:9", "9:19.5", "20:9", "9:20", "auto"] as const;
+export const GROK2API_IMAGE_RESOLUTIONS = ["1k", "2k"] as const;
+export const GROK2API_IMAGE_QUALITIES = ["low", "medium"] as const;
+export const GROK2API_IMAGE_EDIT_LIMIT = 3;
+export const GROK2API_IMAGE_EDIT_LIMIT_20 = 5;
 /** Official Grok video aspect ratios (xAI docs: 1:1, 16:9/9:16, 4:3/3:4, 3:2/2:3). */
 export const GROK2API_VIDEO_ASPECT_RATIOS = ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3"] as const;
 /** Base resolutions for all Grok video models (official default 480p). */
@@ -67,14 +71,54 @@ function closestRatio(value: string | undefined, supported: readonly string[], f
 
 /** Map canvas size (ratio or WxH) to Grok2API image aspect_ratio. */
 export function grok2apiImageAspectRatio(size: string | undefined) {
-    return closestRatio(size, IMAGE_ASPECT_RATIOS, "1:1");
+    const value = (size || "").trim().toLowerCase();
+    if (value === "auto") return "auto";
+    return closestRatio(size, GROK2API_IMAGE_ASPECT_RATIOS, "1:1");
 }
 
-/** Map canvas quality to Grok2API image resolution (1k/2k). */
-export function grok2apiImageResolution(quality: string | undefined) {
+/** Official Image 2.0 quality. Default medium. */
+export function grok2apiImageQuality(quality: string | undefined) {
     const value = (quality || "").trim().toLowerCase();
-    if (value === "high" || value === "hd" || value === "2k" || value === "4k" || value === "medium") return "2k";
+    return value === "low" ? "low" : "medium";
+}
+
+/** Map canvas quality / stored resolution to Grok2API image resolution (1k/2k). */
+export function grok2apiImageResolution(quality: string | undefined, options?: { model?: string; imageResolution?: string }) {
+    const stored = (options?.imageResolution || "").trim().toLowerCase();
+    if (stored === "1k" || stored === "2k") return stored;
+    const value = (quality || "").trim().toLowerCase();
+    if (value === "2k" || value.endsWith("-2k") || value === "high" || value === "hd" || value === "4k") return "2k";
+    if (isGrok2apiImage20(options?.model)) return "1k";
+    if (value === "medium") return "2k";
     return "1k";
+}
+
+export function isGrokImagineImageModel(model: string | undefined) {
+    const id = bareGrok2apiModelId(model);
+    return id === "grok-imagine-image" || id.startsWith("grok-imagine-image-") || id.endsWith("/grok-imagine-image") || id.includes("/grok-imagine-image-");
+}
+
+export function isGrok2apiImage20(model: string | undefined) {
+    const id = bareGrok2apiModelId(model);
+    return id === "grok-imagine-image-2.0" || id.endsWith("/grok-imagine-image-2.0");
+}
+
+export function grok2apiImageEditLimit(model: string | undefined) {
+    return isGrok2apiImage20(model) ? GROK2API_IMAGE_EDIT_LIMIT_20 : GROK2API_IMAGE_EDIT_LIMIT;
+}
+
+export function isGrok2apiImageConfig(config: AiConfig | Pick<AiConfig, "model" | "imageModel" | "apiFormat">) {
+    const modelValue =
+        ("imageModel" in config && config.imageModel?.trim() ? config.imageModel : undefined) ||
+        ("model" in config ? config.model : undefined) ||
+        "";
+    if ("channels" in config) {
+        const requestConfig = resolveModelRequestConfig(config as AiConfig, modelValue);
+        if (requestConfig.apiFormat === "grok2api") return true;
+    } else if ("apiFormat" in config && config.apiFormat === "grok2api") {
+        return true;
+    }
+    return isGrokImagineImageModel(modelValue);
 }
 
 /** Map canvas size to Grok2API video aspect_ratio. */

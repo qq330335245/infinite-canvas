@@ -1,7 +1,7 @@
 import axios from "axios";
 
 import i18n from "@/i18n";
-import { grok2apiImageAspectRatio, grok2apiImageResolution } from "@/lib/grok2api";
+import { grok2apiImageAspectRatio, grok2apiImageEditLimit, grok2apiImageQuality, grok2apiImageResolution, isGrok2apiImage20 } from "@/lib/grok2api";
 import { buildApiUrl, resolveModelRequestConfig, resolveModelScript, type AiConfig, type ModelChannel } from "@/stores/use-config-store";
 import { normalizePluginImages, runModelPlugin } from "./model-plugin";
 import { nanoid } from "nanoid";
@@ -751,9 +751,10 @@ export async function requestGeneration(config: AiConfig, prompt: string, option
                 {
                     model: requestConfig.model,
                     prompt: withSystemPrompt(requestConfig, prompt),
-                    n,
+                    n: Math.min(10, n),
                     aspect_ratio: grok2apiImageAspectRatio(config.size),
-                    resolution: grok2apiImageResolution(config.quality),
+                    resolution: grok2apiImageResolution(config.quality, { model: requestConfig.model, imageResolution: config.imageResolution }),
+                    ...(isGrok2apiImage20(requestConfig.model) ? { quality: grok2apiImageQuality(config.quality) } : {}),
                     response_format: "b64_json",
                 },
                 {
@@ -830,7 +831,7 @@ export async function requestEdit(config: AiConfig, prompt: string, references: 
 
     if (requestConfig.apiFormat === "grok2api") {
         if (mask) throw new Error(apiText("maskModelUnsupported"));
-        const refs = await Promise.all(references.map((image) => imageToDataUrl(image)));
+        const refs = await Promise.all(references.slice(0, grok2apiImageEditLimit(requestConfig.model)).map((image) => imageToDataUrl(image)));
         try {
             const response = await axios.post<ImageApiResponse>(
                 aiApiUrl(requestConfig, "/images/edits"),
@@ -840,7 +841,8 @@ export async function requestEdit(config: AiConfig, prompt: string, references: 
                     n: 1,
                     images: refs.filter(Boolean).map((url) => ({ url })),
                     aspect_ratio: grok2apiImageAspectRatio(config.size),
-                    resolution: grok2apiImageResolution(config.quality),
+                    resolution: grok2apiImageResolution(config.quality, { model: requestConfig.model, imageResolution: config.imageResolution }),
+                    ...(isGrok2apiImage20(requestConfig.model) ? { quality: grok2apiImageQuality(config.quality) } : {}),
                     response_format: "b64_json",
                 },
                 {
