@@ -50,6 +50,8 @@ export type CanvasNodeMetadata = {
     reasoningEffort?: "auto" | "low" | "medium" | "high" | "xhigh";
     size?: string;
     quality?: string;
+    /** Grok image resolution: 1k | 2k (separate from quality low/medium). */
+    imageResolution?: string;
     background?: string;
     count?: number;
     seconds?: string;

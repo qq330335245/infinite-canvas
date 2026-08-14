@@ -4,7 +4,7 @@ import { useTranslation } from "react-i18next";
 
 import i18n from "@/i18n";
 import { type CanvasTheme } from "@/lib/canvas-theme";
-import { GROK2API_IMAGE_ASPECT_RATIOS, GROK2API_IMAGE_QUALITIES, GROK2API_IMAGE_RESOLUTIONS, grok2apiImageQuality, grok2apiImageResolution, isGrok2apiImage20, isGrok2apiImageConfig } from "@/lib/grok2api";
+import { GROK2API_IMAGE_ASPECT_RATIOS, GROK2API_IMAGE_QUALITIES, GROK2API_IMAGE_RESOLUTIONS, grok2apiImageAspectRatio, grok2apiImageQuality, grok2apiImageResolution, isGrok2apiImage20, isGrok2apiImageConfig } from "@/lib/grok2api";
 import type { AiConfig } from "@/stores/use-config-store";
 
 const qualityOptions = [
